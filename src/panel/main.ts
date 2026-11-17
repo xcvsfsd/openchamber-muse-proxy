@@ -129,7 +129,16 @@ function logTone(line: string): 'success' | 'error' | 'info' | 'neutral' {
 
 function splitLog(line: string): { time: string; rest: string } {
   const m = /^(\d{2}:\d{2}:\d{2})\s?(.*)$/.exec(line);
-  return m ? { time: m[1], rest: m[2].slice(0, 140) } : { time: '', rest: line.slice(0, 140) };
+  const rest = (m ? m[2] : line).replace(/(\d+(?:\.\d+)?)B\b/g, (_, n: string) => humanBytes(Number(n)));
+  return m ? { time: m[1], rest: rest.slice(0, 140) } : { time: '', rest: rest.slice(0, 140) };
+}
+
+function humanBytes(n: number): string {
+  if (!isFinite(n)) return `${n}B`;
+  if (n < 1024) return `${Math.round(n)}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)}MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)}GB`;
 }
 
 function draw(full: Full, logs: string[]) {

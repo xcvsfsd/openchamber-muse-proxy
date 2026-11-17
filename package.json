@@ -16,7 +16,8 @@
     "contributes": {
       "service": {
         "entry": "service/main.js",
-        "runtime": "host"
+        "runtime": "host",
+        "permissions": { "exec": ["systemctl", "python3"] }
       },
       "statusSection": {
         "source": {

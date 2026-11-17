@@ -1,5 +1,9 @@
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
+
 // src/service/main.ts
 import http from "node:http";
+import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -72,7 +76,26 @@ async function callProxy(path, body) {
   }
   return { status: r.status, json: j };
 }
-function statusRows() {
+function run(cmd, args, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
+      resolve({ code: err?.code ?? 0, out: String(stdout ?? stderr ?? "").trim() });
+    });
+  });
+}
+async function processState() {
+  let listening = false;
+  try {
+    const r = await fetch(`${BASE}/__health`, { signal: AbortSignal.timeout(3000) });
+    listening = r.ok;
+  } catch {
+    listening = false;
+  }
+  const sys = await run("systemctl", ["--user", "is-active", "muse-proxy.service"]);
+  const unit = (await run("systemctl", ["--user", "cat", "muse-proxy.service"])).code === 0;
+  return { listening, systemd: sys.out || "unknown", unit };
+}
+async function statusRows() {
   if (!health?.reachable || !health?.ok) {
     return { rows: [
       { kind: "line", id: "svc", label: "分流代理", value: "不可达", dot: "error" },
@@ -100,6 +123,15 @@ function statusRows() {
   if (le?.time) {
     rows.push({ kind: "note", id: "err", text: `${le.time} ${le.error}`.slice(0, 160), tone: "error" });
   }
+  const ps = await processState();
+  rows.push({
+    kind: "line",
+    id: "svc",
+    label: "代理进程",
+    value: ps.listening ? `运行中·systemd ${ps.systemd}` : `已停止·systemd ${ps.systemd}`,
+    dot: ps.listening ? "success" : "error",
+    actions: [{ kind: "button", id: "svc", label: ps.listening ? "重启" : "拉起", variant: "outline" }]
+  });
   return { rows };
 }
 function shortNode(n) {
@@ -110,6 +142,27 @@ function probeLabel() {
   if (!p)
     return "未知";
   return p.ok ? `OK·${p.runs}次/${p.failures}败` : `失败·${p.err}`.slice(0, 40);
+}
+async function ensureProxy() {
+  try {
+    const r = await fetch(`${BASE}/__health`, { signal: AbortSignal.timeout(3000) });
+    if (r.ok)
+      return "ok";
+  } catch {}
+  const unit = await run("systemctl", ["--user", "cat", "muse-proxy.service"]);
+  if (unit.code === 0) {
+    const s = await run("systemctl", ["--user", "start", "muse-proxy.service"]);
+    return s.code === 0 ? "ok" : "systemd 启动失败";
+  }
+  const bin = join(homedir(), ".local", "bin", "muse-proxy");
+  const { spawn } = await import("node:child_process");
+  try {
+    const child = spawn("python3", [bin], { detached: true, stdio: "ignore" });
+    child.unref();
+    return "ok";
+  } catch (e) {
+    return `拉起失败：${e instanceof Error ? e.message : e}`;
+  }
 }
 var server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${TOKEN}`) {
@@ -122,11 +175,11 @@ var server = http.createServer((req, res) => {
     return;
   }
   if (req.method === "GET" && path === "/status") {
-    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(statusRows()));
+    statusRows().then((rows) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(rows)), () => res.writeHead(500).end("{}"));
     return;
   }
   if (req.method === "GET" && path === "/full") {
-    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ health, history }));
+    processState().then((ps) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ health, history, process: ps })), () => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ health, history })));
     return;
   }
   let body = "";
@@ -158,6 +211,25 @@ var server = http.createServer((req, res) => {
             res.writeHead(200).end("{}");
           } else
             res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: String(j?.error ?? j?.err ?? "探活失败") }));
+          return;
+        }
+        if (id === "svc") {
+          const ps = await processState();
+          if (ps.listening) {
+            const r = await run("systemctl", ["--user", "restart", "muse-proxy.service"]);
+            if (r.code === 0) {
+              await poll();
+              res.writeHead(200).end("{}");
+            } else
+              res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: "重启失败：无 systemd 或 unit 不存在" }));
+          } else {
+            const msg = await ensureProxy();
+            if (msg === "ok") {
+              await poll();
+              res.writeHead(200).end("{}");
+            } else
+              res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: msg }));
+          }
           return;
         }
       }

@@ -60,7 +60,10 @@ const svcBtn = mountButton(btnRow, {
 });
 const refreshBtn = mountButton(btnRow, {
   label: '刷新', variant: 'outline', size: 'sm',
-  onClick: () => void load(),
+  // 真刷新：先强制探活一轮（顺带刷新 service 缓存），再重拉全部数据
+  onClick: busy({ set: (p) => refreshBtn.update(p) }, async () => {
+    await act('/status', { id: 'probe' }, '已刷新');
+  }),
 });
 
 async function toastResult(r: { status: number; json: unknown }, okMsg: string) {

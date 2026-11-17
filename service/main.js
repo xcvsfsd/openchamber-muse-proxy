@@ -83,6 +83,17 @@ function run(cmd, args, timeoutMs = 8000) {
     });
   });
 }
+var LOG_FILE = join(homedir(), ".local", "share", "muse-proxy.log");
+async function tailLog(n) {
+  try {
+    const raw = await readFile(LOG_FILE, "utf8");
+    const lines = raw.split(`
+`).filter((l) => l.trim().length > 0);
+    return lines.slice(-Math.max(1, Math.min(50, n)));
+  } catch {
+    return [];
+  }
+}
 async function processState() {
   let listening = false;
   try {
@@ -176,6 +187,11 @@ var server = http.createServer((req, res) => {
   }
   if (req.method === "GET" && path === "/status") {
     statusRows().then((rows) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(rows)), () => res.writeHead(500).end("{}"));
+    return;
+  }
+  if (req.method === "GET" && path === "/logs") {
+    const m = /lines=(\d+)/.exec(new URL(req.url ?? "/", "http://x").search);
+    tailLog(m ? Number(m[1]) : 10).then((lines) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ lines })), () => res.writeHead(500).end("{}"));
     return;
   }
   if (req.method === "GET" && path === "/full") {

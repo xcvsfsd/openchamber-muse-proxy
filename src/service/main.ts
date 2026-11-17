@@ -94,6 +94,18 @@ function run(cmd: string, args: string[], timeoutMs = 8000): Promise<{ code: num
   });
 }
 
+const LOG_FILE = join(homedir(), '.local', 'share', 'muse-proxy.log');
+
+async function tailLog(n: number): Promise<string[]> {
+  try {
+    const raw = await readFile(LOG_FILE, 'utf8');
+    const lines = raw.split('\n').filter((l) => l.trim().length > 0);
+    return lines.slice(-Math.max(1, Math.min(50, n)));
+  } catch {
+    return [];
+  }
+}
+
 async function processState(): Promise<{ listening: boolean; systemd: string; unit: boolean }> {
   let listening = false;
   try {
@@ -174,6 +186,14 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && path === '/status') {
     statusRows().then(
       (rows) => res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(rows)),
+      () => res.writeHead(500).end('{}'),
+    );
+    return;
+  }
+  if (req.method === 'GET' && path === '/logs') {
+    const m = /lines=(\d+)/.exec(new URL(req.url ?? '/', 'http://x').search);
+    tailLog(m ? Number(m[1]) : 10).then(
+      (lines) => res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ lines })),
       () => res.writeHead(500).end('{}'),
     );
     return;

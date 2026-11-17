@@ -111,7 +111,7 @@ function streamRow(full: { streams?: {
 
 async function load() {
   try {
-    const [f, l] = await Promise.all([req('/full'), req('/logs?lines=10')]);
+    const [f, l] = await Promise.all([req('/full'), req('/logs?lines=5')]);
     if (f.status !== 200 || !f.json) throw new Error(`full http-${f.status}`);
     draw(f.json as Full, (l.json as { lines?: string[] } | null)?.lines ?? []);
   } catch (e) {
@@ -194,7 +194,7 @@ function draw(full: Full, logs: string[]) {
   if (items.length === 0) {
     mountText(histBox, { text: '暂无记录' });
   } else {
-    mountList(histBox, { ariaLabel: '历史记录', onSelect: () => {}, items: items.slice(0, 20) });
+    mountList(histBox, { ariaLabel: '历史记录', onSelect: () => {}, items: items.slice(0, 5) });
   }
   try {
     void host.setHeight(Math.min(700, Math.ceil(root.getBoundingClientRect().height)));

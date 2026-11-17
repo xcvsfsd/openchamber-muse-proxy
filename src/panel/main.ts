@@ -72,6 +72,12 @@ async function toastResult(r: { status: number; json: unknown }, okMsg: string) 
   }
 }
 
+type Streams = {
+  active: number; longest_active_s: number; closed: number;
+  last_closed_s: number; errors: number;
+  last_e2e_first_ms: number | null; last_up_first_ms: number | null;
+};
+
 type Full = {
   health: {
     reachable: boolean; at: string; proxy: string;
@@ -79,25 +85,18 @@ type Full = {
     preflight: { ok: boolean; err: string; runs: number; failures: number };
     autoswitch: { enabled: boolean; group: string; now: string; now_blocked: boolean };
     last_error: { time: string; error: string };
+    streams?: Streams;
   };
   history: { switches: string[]; errors: string[] };
   process?: { listening: boolean; systemd: string; unit: boolean };
-  streams?: {
-    active: number; longest_active_s: number; closed: number;
-    last_closed_s: number; errors: number;
-    last_e2e_first_ms: number | null; last_up_first_ms: number | null;
-  };
 };
 
 const ms = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v}ms`);
 
 // 五项流指标合成一行：标题放两个首字节，副标题放计数，异常/在用时挂徽标。
-function streamRow(full: { streams?: {
-  active: number; longest_active_s: number; closed: number;
-  last_closed_s: number; errors: number;
-  last_e2e_first_ms: number | null; last_up_first_ms: number | null;
-} }) {
-  const s = full.streams;
+// 注意 streams 在 health 里面（service 原样透传 __health），不是顶层。
+function streamRow(h: { streams?: Streams }) {
+  const s = h.streams;
   const item: { id: string; title: string; subtitle: string; meta: string; badge?: { label: string; tone: 'error' | 'info' } } = {
     id: 'streams',
     title: `首字节 ${ms(s?.last_e2e_first_ms)} / 上游 ${ms(s?.last_up_first_ms)}`,
@@ -162,7 +161,7 @@ function draw(full: Full, logs: string[]) {
       { id: 'node', title: h.autoswitch?.now ?? '未知', subtitle: `策略组 ${h.autoswitch?.group ?? '-'}`, meta: h.at ?? '' },
       { id: 'proc', title: full.process ? (full.process.listening ? '代理进程运行中' : '代理进程已停止') : '进程状态未知', subtitle: full.process ? `systemd ${full.process.systemd}·unit${full.process.unit ? '已注册' : '未注册'}` : '', meta: '' },
       { id: 'probe', title: h.preflight?.ok ? '探活正常' : `探活失败 ${h.preflight?.err ?? ''}`, subtitle: `成功 ${h.preflight?.runs ?? 0} / 失败 ${h.preflight?.failures ?? 0}`, meta: '' },
-      streamRow(full),
+      streamRow(h),
       { id: 'err', title: h.last_error?.time ? `最近异常 ${h.last_error.time}` : '暂无异常', subtitle: (h.last_error?.error ?? '').slice(0, 120), meta: '' },
     ],
   });

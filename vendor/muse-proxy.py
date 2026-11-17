@@ -96,6 +96,70 @@ PROBER = {"runs": 0, "failures": 0, "last_run": ""}
 
 _STATE_LOCK = threading.Lock()
 
+# 流统计：面板要的实时指标，只记内存（重启清零）
+STATS = {
+    "seq": 0,
+    "active": {},           # sid -> start_ts
+    "closed": 0,            # 已关闭流累计
+    "last_closed_s": 0.0,   # 上一条关闭流持续秒
+    "errors": 0,            # 错误响应 + 流中断累计
+    "last_e2e_first_ms": None,  # 上条端到端首字节：收到请求→首字节发给客户端
+    "last_up_first_ms": None,   # 上条上游首字节：收到请求→上游响应头
+}
+
+
+def stat_start() -> str:
+    with _STATE_LOCK:
+        STATS["seq"] += 1
+        sid = str(STATS["seq"])
+        STATS["active"][sid] = time.time()
+    return sid
+
+
+def stat_drop(sid: str) -> None:
+    with _STATE_LOCK:
+        STATS["active"].pop(sid, None)
+
+
+def stat_up_first(sid: str) -> None:
+    with _STATE_LOCK:
+        start = STATS["active"].get(sid)
+        if start is not None:
+            STATS["last_up_first_ms"] = int((time.time() - start) * 1000)
+
+
+def stat_e2e_first(sid: str) -> None:
+    with _STATE_LOCK:
+        start = STATS["active"].get(sid)
+        if start is not None:
+            STATS["last_e2e_first_ms"] = int((time.time() - start) * 1000)
+
+
+def stat_close(sid: str, bad: bool) -> None:
+    now = time.time()
+    with _STATE_LOCK:
+        start = STATS["active"].pop(sid, None)
+        if start is not None:
+            STATS["closed"] += 1
+            STATS["last_closed_s"] = round(now - start, 2)
+        if bad:
+            STATS["errors"] += 1
+
+
+def stat_snapshot():
+    now = time.time()
+    with _STATE_LOCK:
+        act = list(STATS["active"].values())
+        return {
+            "active": len(act),
+            "longest_active_s": round(now - min(act), 1) if act else 0,
+            "closed": STATS["closed"],
+            "last_closed_s": STATS["last_closed_s"],
+            "errors": STATS["errors"],
+            "last_e2e_first_ms": STATS["last_e2e_first_ms"],
+            "last_up_first_ms": STATS["last_up_first_ms"],
+        }
+
 
 def node_blocked(name: str) -> bool:
     """muse 禁用节点判断（香港出口不可用）。"""
@@ -341,13 +405,15 @@ def probe_proxy(_ctx=None, _force: bool = False):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "muse-proxy/1.6"
+    server_version = "muse-proxy/1.7"
 
     def log_message(self, fmt, *args):  # 不打印默认访问日志，避免噪音
         return
 
     # ---------- 异常要能让客户端看见（否则对话里就是一直转圈） ----------
     def send_proxy_error(self, status: int, message: str) -> None:
+        with _STATE_LOCK:
+            STATS["errors"] += 1
         payload = json.dumps({
             "error": {
                 "type": "muse_proxy_error",
@@ -446,6 +512,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "now_blocked": node_blocked(GROUP["now"]),
                 },
                 "last_error": LAST,
+                "streams": stat_snapshot(),
             }, ensure_ascii=False).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -618,6 +685,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 2) 发请求；失败或 403 地区限制则换节点重试一次
         attempts = 0
         switched = ""
+        sid = stat_start()  # 从这里起算一条在用流；下面所有错误返回前都要先注销
         while True:
             attempts += 1
             stage = "建连" if via_proxy else "直连建连"
@@ -630,6 +698,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.sock.settimeout(FIRST_BYTE_TIMEOUT)
                 conn.request(method, self.path, body=body or None, headers=headers)
                 resp = conn.getresponse()
+                stat_up_first(sid)
             except Exception as e:
                 if via_proxy and attempts == 1 and AUTOSWITCH:
                     node = switch_node(exclude=(switched,) if switched else ())
@@ -654,12 +723,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         conn.sock.settimeout(FIRST_BYTE_TIMEOUT)
                         conn.request(method, self.path, body=body or None, headers=headers)
                         resp = conn.getresponse()
+                        stat_up_first(sid)
                         log(f"[{method} {self.path}] 上游已连接({time.time() - t0:.2f}s) 直连(降级)")
                     except Exception as e2:
                         msg = (f"muse-proxy 连不上上游（代理不可用，直连 {CFG['upstream']} 也失败）："
                                f"{e2}；检查 Clash 是否运行、节点是否可用")
                         log(f"[{method} {self.path}] {msg}")
                         note_error(self.path, "direct", msg)
+                        stat_drop(sid)
                         self.send_proxy_error(502, msg)
                         return
                 else:
@@ -667,6 +738,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            f"（{FIRST_BYTE_TIMEOUT}s 内上游无数据则为上游/节点卡住）")
                     log(f"[{method} {self.path}] {msg}")
                     note_error(self.path, "direct", msg)
+                    stat_drop(sid)
                     self.send_proxy_error(504 if stage == "等待上游首字节" else 502, msg)
                     return
 
@@ -690,6 +762,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     conn.close()
                 except Exception:
                     pass
+                stat_drop(sid)
                 self.send_proxy_error(403, msg)
                 return
             break
@@ -710,6 +783,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.close()
             except Exception:
                 pass
+            stat_drop(sid)
             self.send_proxy_error(resp.status, msg)
             return
 
@@ -721,6 +795,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # 一律 chunked，保证 SSE 边收边发
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+        self.wfile.flush()
+        stat_e2e_first(sid)  # 首字节已发出：端到端首字节
 
         sent = 0
         err = None
@@ -747,6 +823,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
         finally:
             dur = time.time() - t0
+            stat_close(sid, bad=err is not None and err.startswith("流中断"))
             if err:
                 msg = f"muse-proxy {err}，已发 {sent}B 后断开（本轮回复不完整）"
                 log(f"[{method} {self.path}] {msg} 用时 {dur:.2f}s")

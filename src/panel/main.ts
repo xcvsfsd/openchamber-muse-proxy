@@ -82,7 +82,14 @@ type Full = {
   };
   history: { switches: string[]; errors: string[] };
   process?: { listening: boolean; systemd: string; unit: boolean };
+  streams?: {
+    active: number; longest_active_s: number; closed: number;
+    last_closed_s: number; errors: number;
+    last_e2e_first_ms: number | null; last_up_first_ms: number | null;
+  };
 };
+
+const ms = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v} ms`);
 
 async function load() {
   try {
@@ -128,7 +135,11 @@ function draw(full: Full, logs: string[]) {
       { id: 'node', title: h.autoswitch?.now ?? '未知', subtitle: `策略组 ${h.autoswitch?.group ?? '-'}`, meta: h.at ?? '' },
       { id: 'proc', title: full.process ? (full.process.listening ? '代理进程运行中' : '代理进程已停止') : '进程状态未知', subtitle: full.process ? `systemd ${full.process.systemd}·unit${full.process.unit ? '已注册' : '未注册'}` : '', meta: '' },
       { id: 'probe', title: h.preflight?.ok ? '探活正常' : `探活失败 ${h.preflight?.err ?? ''}`, subtitle: `成功 ${h.preflight?.runs ?? 0} / 失败 ${h.preflight?.failures ?? 0}`, meta: '' },
-      { id: 'timeout', title: '超时 建连/首字节/流空闲', subtitle: `${h.timeouts?.connect ?? '-'}/${h.timeouts?.first_byte ?? '-'}（首字节）/${h.timeouts?.stream_idle ?? '-'}s`, meta: '' },
+      { id: 'fb', title: `响应首字节 ${ms(full.streams?.last_e2e_first_ms)}`, subtitle: '端到端：收到请求到首字节发出', meta: '' },
+      { id: 'upfb', title: `代理首字节 ${ms(full.streams?.last_up_first_ms)}`, subtitle: '收到请求到上游响应头', meta: '' },
+      { id: 'errs', title: `异常 ${full.streams?.errors ?? 0} 次`, subtitle: '错误响应与流中断累计（重启清零）', meta: '' },
+      { id: 'active', title: `在用流 ${full.streams?.active ?? 0} 个`, subtitle: (full.streams?.active ?? 0) > 0 ? `最长已持续 ${full.streams?.longest_active_s ?? 0} s` : '当前空闲', meta: '' },
+      { id: 'closed', title: `已关闭流 ${full.streams?.closed ?? 0} 个`, subtitle: (full.streams?.closed ?? 0) > 0 ? `上一条持续 ${full.streams?.last_closed_s ?? 0} s` : '暂无', meta: '' },
       { id: 'err', title: h.last_error?.time ? `最近异常 ${h.last_error.time}` : '暂无异常', subtitle: (h.last_error?.error ?? '').slice(0, 120), meta: '' },
     ],
   });

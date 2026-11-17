@@ -39,31 +39,20 @@ function busy(btn: { update: (p: object) => void }, fn: () => Promise<void>) {
 
 const switchBtn = mountButton(btnRow, {
   label: '换节点', variant: 'default', size: 'sm',
-  onClick: busy({ update: (p) => switchBtn.update(p) }, async () => {
-    const r = await req('/status', 'POST', { id: 'switch' });
-    await toastResult(r, '已换节点');
-  }),
+  onClick: busy({ update: (p) => switchBtn.update(p) }, () => act('/status', { id: 'switch' }, '已换节点')),
 });
 const probeBtn = mountButton(btnRow, {
   label: '立即探活', variant: 'secondary', size: 'sm',
-  onClick: busy({ update: (p) => probeBtn.update(p) }, async () => {
-    const r = await req('/status', 'POST', { id: 'probe' });
-    await toastResult(r, '探活完成');
-  }),
+  onClick: busy({ update: (p) => probeBtn.update(p) }, () => act('/status', { id: 'probe' }, '探活完成')),
 });
 const svcBtn = mountButton(btnRow, {
   label: '重启/拉起', variant: 'destructive', size: 'sm',
-  onClick: busy({ update: (p) => svcBtn.update(p) }, async () => {
-    const r = await req('/status', 'POST', { id: 'svc' });
-    await toastResult(r, '已执行');
-  }),
+  onClick: busy({ update: (p) => svcBtn.update(p) }, () => act('/status', { id: 'svc' }, '已执行')),
 });
 const refreshBtn = mountButton(btnRow, {
   label: '刷新', variant: 'outline', size: 'sm',
   // 真刷新：先强制探活一轮（顺带刷新 service 缓存），再重拉全部数据
-  onClick: busy({ set: (p) => refreshBtn.update(p) }, async () => {
-    await act('/status', { id: 'probe' }, '已刷新');
-  }),
+  onClick: busy({ update: (p: object) => refreshBtn.update(p) }, () => act('/status', { id: 'probe' }, '已刷新')),
 });
 
 async function toastResult(r: { status: number; json: unknown }, okMsg: string) {
@@ -72,6 +61,15 @@ async function toastResult(r: { status: number; json: unknown }, okMsg: string) 
     await load();
   } else {
     await host.toast({ kind: 'error', message: String((r.json as { message?: string } | null)?.message ?? '操作失败') });
+  }
+}
+
+async function act(path: string, body: unknown, okMsg: string) {
+  try {
+    const r = await req(path, 'POST', body);
+    await toastResult(r, okMsg);
+  } catch (e) {
+    await host.toast({ kind: 'error', message: `请求失败：${e instanceof Error ? e.message : e}` });
   }
 }
 

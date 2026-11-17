@@ -1,0 +1,46 @@
+{
+  "name": "openchamber-muse-proxy",
+  "version": "0.1.0",
+  "description": "muse 分流代理状态：节点、探活、异常 + 一键换节点",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.7.2"
+    },
+    "id": "muse-proxy",
+    "name": "Muse 代理",
+    "icon": "wifi",
+    "contributes": {
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host"
+      },
+      "statusSection": {
+        "source": {
+          "path": "/status",
+          "interval": 5000
+        },
+        "title": "Muse 代理"
+      },
+      "panel": {
+        "entry": "panel/index.html",
+        "name": "Muse 代理",
+        "icon": "wifi"
+      }
+    }
+  },
+  "scripts": {
+    "build": "bunx openchamber-guest-bundle src/panel/main.ts panel/main.js && bunx openchamber-guest-bundle --node src/service/main.ts service/main.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@openchamber/sdk": "2.7.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

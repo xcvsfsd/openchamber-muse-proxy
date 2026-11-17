@@ -91,7 +91,11 @@ type Full = {
   process?: { listening: boolean; systemd: string; unit: boolean };
 };
 
-const ms = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v}ms`);
+const ms = (v: number | null | undefined) => {
+  if (v === null || v === undefined) return '—';
+  if (v < 1000) return `${v}ms`;
+  return `${(v / 1000).toFixed(1)}s`;
+};
 
 // 五项流指标合成一行：标题放两个首字节，副标题放计数，异常/在用时挂徽标。
 // 注意 streams 在 health 里面（service 原样透传 __health），不是顶层。
@@ -100,8 +104,8 @@ function streamRow(h: { streams?: Streams }) {
   const item: { id: string; title: string; subtitle: string; meta: string; badge?: { label: string; tone: 'error' | 'info' } } = {
     id: 'streams',
     title: `首字节 ${ms(s?.last_e2e_first_ms)} / 上游 ${ms(s?.last_up_first_ms)}`,
-    subtitle: `在用 ${s?.active ?? 0} · 已关 ${s?.closed ?? 0} · 异常 ${s?.errors ?? 0}`,
-    meta: (s?.active ?? 0) > 0 ? `最长${s?.longest_active_s ?? 0}s` : '',
+    subtitle: `在用 ${s?.active ?? 0} · 已关 ${s?.closed ?? 0} · 异常 ${s?.errors ?? 0}（错误响应+流中断，重启清零）`,
+    meta: (s?.active ?? 0) > 0 ? `最长${s?.longest_active_s ?? 0}s（当前最久的在用流）` : '',
   };
   if ((s?.errors ?? 0) > 0) item.badge = { label: `异常${s?.errors}`, tone: 'error' };
   else if ((s?.active ?? 0) > 0) item.badge = { label: `在用${s?.active}`, tone: 'info' };
@@ -203,7 +207,6 @@ function draw(full: Full, logs: string[]) {
       { id: 'proc', title: full.process ? (full.process.listening ? '代理进程运行中' : '代理进程已停止') : '进程状态未知', subtitle: full.process ? `systemd ${full.process.systemd}·unit${full.process.unit ? '已注册' : '未注册'}` : '', meta: '' },
       { id: 'probe', title: h.preflight?.ok ? '探活正常' : `探活失败 ${h.preflight?.err ?? ''}`, subtitle: `成功 ${h.preflight?.runs ?? 0} / 失败 ${h.preflight?.failures ?? 0}`, meta: '' },
       streamRow(h),
-      { id: 'err', title: h.last_error?.time ? `最近异常 ${h.last_error.time}` : '暂无异常', subtitle: (h.last_error?.error ?? ''), meta: '' },
     ],
   });
 

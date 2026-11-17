@@ -1,6 +1,8 @@
 # openchamber-muse-proxy
 
-muse 分流代理（`~/.local/bin/muse-proxy`）的 OpenChamber 扩展：工作区状态条 + 详情面板。
+muse 分流代理（`~/.local/bin/muse-proxy`）的 OpenChamber 扩展：Rail 面板 + 后台 service。
+
+![Muse 代理面板](screenshot.png)
 
 - 状态条：当前节点 / 探活结果 / 最近异常 / 代理进程，带换节点、探活、重启/拉起按钮
 - 面板：超时配置、探活统计、进程状态、最近异常与换节点记录，可操作

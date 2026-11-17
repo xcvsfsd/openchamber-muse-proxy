@@ -1,6 +1,6 @@
 {
   "name": "openchamber-muse-proxy",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "muse 分流代理状态：节点、探活、异常 + 一键换节点",
   "private": true,
   "type": "module",
@@ -12,7 +12,7 @@
     },
     "id": "muse-proxy",
     "name": "Muse 代理",
-    "icon": "wifi",
+    "icon": "assets/icon.svg",
     "contributes": {
       "service": {
         "entry": "service/main.js",

@@ -58,7 +58,6 @@ const refreshBtn = mountButton(btnRow, {
 async function toastResult(r: { status: number; json: unknown }, okMsg: string) {
   if (r.status >= 200 && r.status < 300) {
     await host.toast({ kind: 'success', message: okMsg });
-    await load();
   } else {
     await host.toast({ kind: 'error', message: String((r.json as { message?: string } | null)?.message ?? '操作失败') });
   }
@@ -68,6 +67,7 @@ async function act(path: string, body: unknown, okMsg: string) {
   try {
     const r = await req(path, 'POST', body);
     await toastResult(r, okMsg);
+    await load(true);
   } catch (e) {
     await host.toast({ kind: 'error', message: `请求失败：${e instanceof Error ? e.message : e}` });
   }
@@ -113,11 +113,11 @@ function streamRow(h: { streams?: Streams }) {
   return item;
 }
 
-async function load() {
+async function load(force = false) {
   try {
     const [f, l] = await Promise.all([req('/full'), req('/logs?lines=5')]);
     if (f.status !== 200 || !f.json) throw new Error(`full http-${f.status}`);
-    draw(f.json as Full, (l.json as { lines?: string[] } | null)?.lines ?? []);
+    draw(f.json as Full, (l.json as { lines?: string[] } | null)?.lines ?? [], force);
   } catch (e) {
     stateBox.textContent = '';
     mountText(stateBox, { text: `服务不可用：${e instanceof Error ? e.message : e}` });
@@ -186,11 +186,9 @@ function humanBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)}GB`;
 }
 
-function draw(full: Full, logs: string[]) {
+function draw(full: Full, logs: string[], force = false) {
   const h = full.health;
   stateBox.textContent = '';
-  logBox.textContent = '';
-  histBox.textContent = '';
   if (!h?.reachable) {
     statusBadge.update({ label: '不可达', tone: 'error' });
     mountText(stateBox, { text: '分流代理不可达：检查 muse-proxy.service' });
@@ -210,6 +208,12 @@ function draw(full: Full, logs: string[]) {
       streamRow(h),
     ],
   });
+
+  // 鼠标正停在日志/历史区看浮框时不重建 DOM，否则锚点被删导致浮框反复开关
+  if (hovering && !force) return;
+
+  logBox.textContent = '';
+  histBox.textContent = '';
 
   mountSeparator(logBox, {});
   mountText(logBox, { text: '最近日志（移入看全文）' });
@@ -241,8 +245,25 @@ function draw(full: Full, logs: string[]) {
     }
   }
   try {
-    void host.setHeight(Math.min(700, Math.ceil(root.getBoundingClientRect().height)));
+    const hgt = Math.min(700, Math.ceil(root.getBoundingClientRect().height));
+    if (Math.abs(hgt - lastHeight) > 8) {
+      lastHeight = hgt;
+      void host.setHeight(hgt);
+    }
   } catch { /* 非面板表面忽略 */ }
+}
+
+// 自动刷新 15s 一次。鼠标停在日志/历史区时跳过重建（浮框开着），
+// 鼠标离开后再刷一次；手动点刷新则强制重建。
+let hovering = false;
+let lastHeight = 0;
+for (const box of [logBox, histBox]) {
+  box.addEventListener('mouseenter', () => { hovering = true; });
+  box.addEventListener('mouseleave', () => {
+    if (!hovering) return;
+    hovering = false;
+    void load();
+  });
 }
 
 let booted = false;

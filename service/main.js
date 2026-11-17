@@ -52,7 +52,7 @@ async function poll() {
     const et = j.last_error?.time ?? "";
     if (et && et !== lastErrTime) {
       lastErrTime = et;
-      history.errors.unshift(`${et} ${j.last_error?.error ?? ""}`.slice(0, 200));
+      history.errors.unshift(`${et} ${j.last_error?.error ?? ""}`.slice(0, 500));
       history.errors = history.errors.slice(0, 20);
       saveState();
     }

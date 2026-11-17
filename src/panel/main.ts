@@ -129,7 +129,7 @@ function logTone(line: string): 'success' | 'error' | 'info' | 'neutral' {
 function splitLog(line: string): { time: string; rest: string } {
   const m = /^(\d{2}:\d{2}:\d{2})\s?(.*)$/.exec(line);
   const rest = (m ? m[2] : line).replace(/(\d+(?:\.\d+)?)B\b/g, (_, n: string) => humanBytes(Number(n)));
-  return m ? { time: m[1], rest: rest.slice(0, 140) } : { time: '', rest: rest.slice(0, 140) };
+  return m ? { time: m[1], rest } : { time: '', rest };
 }
 
 function humanBytes(n: number): string {
@@ -162,7 +162,7 @@ function draw(full: Full, logs: string[]) {
       { id: 'proc', title: full.process ? (full.process.listening ? '代理进程运行中' : '代理进程已停止') : '进程状态未知', subtitle: full.process ? `systemd ${full.process.systemd}·unit${full.process.unit ? '已注册' : '未注册'}` : '', meta: '' },
       { id: 'probe', title: h.preflight?.ok ? '探活正常' : `探活失败 ${h.preflight?.err ?? ''}`, subtitle: `成功 ${h.preflight?.runs ?? 0} / 失败 ${h.preflight?.failures ?? 0}`, meta: '' },
       streamRow(h),
-      { id: 'err', title: h.last_error?.time ? `最近异常 ${h.last_error.time}` : '暂无异常', subtitle: (h.last_error?.error ?? '').slice(0, 120), meta: '' },
+      { id: 'err', title: h.last_error?.time ? `最近异常 ${h.last_error.time}` : '暂无异常', subtitle: (h.last_error?.error ?? ''), meta: '' },
     ],
   });
 
@@ -188,7 +188,7 @@ function draw(full: Full, logs: string[]) {
   mountText(histBox, { text: '换节点与异常记录' });
   const items = [
     ...(full.history?.switches ?? []).map((s, i) => ({ id: `s${i}`, title: s, subtitle: '换节点', meta: '' })),
-    ...(full.history?.errors ?? []).map((s, i) => ({ id: `e${i}`, title: s.slice(0, 120), subtitle: '异常', meta: '' })),
+    ...(full.history?.errors ?? []).map((s, i) => ({ id: `e${i}`, title: s, subtitle: '异常', meta: '' })),
   ];
   if (items.length === 0) {
     mountText(histBox, { text: '暂无记录' });

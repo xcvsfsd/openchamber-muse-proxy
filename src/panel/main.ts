@@ -1,6 +1,6 @@
 // Muse 代理面板：状态一览 + 最近日志 + 操作按钮 + 历史记录。
 import { connectHost } from '@openchamber/sdk';
-import { applyHostReady, mountBadge, mountButton, mountEmpty, mountList, mountSeparator, mountText } from '@openchamber/sdk/ui';
+import { applyHostReady, mountBadge, mountButton, mountEmpty, mountList, mountPopoverAnchor, mountSeparator, mountText } from '@openchamber/sdk/ui';
 
 const host = connectHost();
 const root = document.querySelector<HTMLElement>('#root')!;
@@ -126,6 +126,47 @@ function logTone(line: string): 'success' | 'error' | 'info' | 'neutral' {
   return 'neutral';
 }
 
+// 一行展示 + 移入浮框看全文。浮框走 host popover（surface=popover 时本页会重载为卡片模式）。
+// 老版本 host 不支持 popover 时，点一行用 toast 看全文（可复制）。
+function hoverRow(time: string, text: string, full: { title: string; body: string }) {
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:8px;align-items:baseline;padding:6px 4px;border-bottom:1px solid var(--oc-sdk-edge);';
+  if (time) {
+    const t = document.createElement('span');
+    t.style.cssText = 'font-family:monospace;white-space:nowrap;opacity:0.7;font-size:12px;';
+    t.textContent = time;
+    row.appendChild(t);
+  }
+  const tx = document.createElement('span');
+  tx.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;';
+  row.appendChild(tx);
+  mountText(tx, { text });
+  try {
+    mountPopoverAnchor(row, { host, getData: () => ({ ...full }), width: 380, height: 150 });
+  } catch { /* 老 host 不支持 popover，用下面的点击查看 */ }
+  row.addEventListener('click', () => void host.toast({ kind: 'info', message: full.body, copy: { text: full.body } }));
+  return row;
+}
+
+// popover 子框：本页被 host 以 surface=popover 重新载入，用 data 画卡片。
+function drawPopoverCard(data: unknown) {
+  root.textContent = '';
+  const d = (typeof data === 'object' && data !== null ? data : {}) as { title?: string; body?: string };
+  if (d.title) {
+    const h = document.createElement('div');
+    h.style.cssText = 'font-weight:600;margin-bottom:6px;';
+    root.appendChild(h);
+    mountText(h, { text: d.title });
+  }
+  const b = document.createElement('div');
+  b.style.cssText = 'white-space:pre-wrap;word-break:break-word;';
+  root.appendChild(b);
+  mountText(b, { text: d.body ?? '（空）' });
+  try {
+    void host.setHeight(Math.min(420, Math.ceil(root.scrollHeight) + 24));
+  } catch { /* 忽略 */ }
+}
+
 function splitLog(line: string): { time: string; rest: string } {
   const m = /^(\d{2}:\d{2}:\d{2})\s?(.*)$/.exec(line);
   const rest = (m ? m[2] : line).replace(/(\d+(?:\.\d+)?)B\b/g, (_, n: string) => humanBytes(Number(n)));
@@ -167,33 +208,33 @@ function draw(full: Full, logs: string[]) {
   });
 
   mountSeparator(logBox, {});
-  mountText(logBox, { text: '最近日志' });
+  mountText(logBox, { text: '最近日志（移入看全文）' });
   if (logs.length === 0) {
     mountEmpty(logBox, { title: '暂无日志' });
   } else {
-    mountList(logBox, {
-      ariaLabel: '最近日志',
-      onSelect: () => {},
-      items: logs.map((line, i) => {
-        const { time, rest } = splitLog(line);
-        const tone = logTone(line);
-        return tone === 'neutral'
-          ? { id: `l${i}`, title: rest, subtitle: '', meta: time, leading: '' }
-          : { id: `l${i}`, title: rest, subtitle: '', meta: time, badge: { label: tone === 'error' ? '异常' : tone === 'info' ? '操作' : '正常', tone } };
-      }),
-    });
+    const wrap = document.createElement('div');
+    logBox.appendChild(wrap);
+    for (const [i, line] of logs.entries()) {
+      const { time, rest } = splitLog(line);
+      wrap.appendChild(hoverRow(time, rest.slice(0, 70), { title: time || '日志', body: rest }));
+      void i;
+    }
   }
 
   mountSeparator(histBox, {});
-  mountText(histBox, { text: '换节点与异常记录' });
+  mountText(histBox, { text: '换节点与异常记录（移入看全文）' });
   const items = [
-    ...(full.history?.switches ?? []).map((s, i) => ({ id: `s${i}`, title: s, subtitle: '换节点', meta: '' })),
-    ...(full.history?.errors ?? []).map((s, i) => ({ id: `e${i}`, title: s, subtitle: '异常', meta: '' })),
+    ...(full.history?.switches ?? []).map((s) => ({ text: s.slice(0, 80), full: s, sub: '换节点' })),
+    ...(full.history?.errors ?? []).map((s) => ({ text: s.slice(0, 80), full: s, sub: '异常' })),
   ];
   if (items.length === 0) {
     mountText(histBox, { text: '暂无记录' });
   } else {
-    mountList(histBox, { ariaLabel: '历史记录', onSelect: () => {}, items: items.slice(0, 5) });
+    const wrap = document.createElement('div');
+    histBox.appendChild(wrap);
+    for (const it of items.slice(0, 5)) {
+      wrap.appendChild(hoverRow('', it.text, { title: it.sub, body: it.full }));
+    }
   }
   try {
     void host.setHeight(Math.min(700, Math.ceil(root.getBoundingClientRect().height)));
@@ -203,6 +244,10 @@ function draw(full: Full, logs: string[]) {
 let booted = false;
 host.onReady((context) => {
   applyHostReady(context, document.documentElement);
+  if (context.surface === 'popover') {
+    drawPopoverCard(context.popover?.data);
+    return;
+  }
   if (booted) { void load(); return; }
   booted = true;
   void load();

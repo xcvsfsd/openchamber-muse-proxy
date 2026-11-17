@@ -89,7 +89,25 @@ type Full = {
   };
 };
 
-const ms = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v} ms`);
+const ms = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${v}ms`);
+
+// 五项流指标合成一行：标题放两个首字节，副标题放计数，异常/在用时挂徽标。
+function streamRow(full: { streams?: {
+  active: number; longest_active_s: number; closed: number;
+  last_closed_s: number; errors: number;
+  last_e2e_first_ms: number | null; last_up_first_ms: number | null;
+} }) {
+  const s = full.streams;
+  const item: { id: string; title: string; subtitle: string; meta: string; badge?: { label: string; tone: 'error' | 'info' } } = {
+    id: 'streams',
+    title: `首字节 ${ms(s?.last_e2e_first_ms)} / 上游 ${ms(s?.last_up_first_ms)}`,
+    subtitle: `在用 ${s?.active ?? 0} · 已关 ${s?.closed ?? 0} · 异常 ${s?.errors ?? 0}`,
+    meta: (s?.active ?? 0) > 0 ? `最长${s?.longest_active_s ?? 0}s` : '',
+  };
+  if ((s?.errors ?? 0) > 0) item.badge = { label: `异常${s?.errors}`, tone: 'error' };
+  else if ((s?.active ?? 0) > 0) item.badge = { label: `在用${s?.active}`, tone: 'info' };
+  return item;
+}
 
 async function load() {
   try {
@@ -135,11 +153,7 @@ function draw(full: Full, logs: string[]) {
       { id: 'node', title: h.autoswitch?.now ?? '未知', subtitle: `策略组 ${h.autoswitch?.group ?? '-'}`, meta: h.at ?? '' },
       { id: 'proc', title: full.process ? (full.process.listening ? '代理进程运行中' : '代理进程已停止') : '进程状态未知', subtitle: full.process ? `systemd ${full.process.systemd}·unit${full.process.unit ? '已注册' : '未注册'}` : '', meta: '' },
       { id: 'probe', title: h.preflight?.ok ? '探活正常' : `探活失败 ${h.preflight?.err ?? ''}`, subtitle: `成功 ${h.preflight?.runs ?? 0} / 失败 ${h.preflight?.failures ?? 0}`, meta: '' },
-      { id: 'fb', title: `响应首字节 ${ms(full.streams?.last_e2e_first_ms)}`, subtitle: '端到端：收到请求到首字节发出', meta: '' },
-      { id: 'upfb', title: `代理首字节 ${ms(full.streams?.last_up_first_ms)}`, subtitle: '收到请求到上游响应头', meta: '' },
-      { id: 'errs', title: `异常 ${full.streams?.errors ?? 0} 次`, subtitle: '错误响应与流中断累计（重启清零）', meta: '' },
-      { id: 'active', title: `在用流 ${full.streams?.active ?? 0} 个`, subtitle: (full.streams?.active ?? 0) > 0 ? `最长已持续 ${full.streams?.longest_active_s ?? 0} s` : '当前空闲', meta: '' },
-      { id: 'closed', title: `已关闭流 ${full.streams?.closed ?? 0} 个`, subtitle: (full.streams?.closed ?? 0) > 0 ? `上一条持续 ${full.streams?.last_closed_s ?? 0} s` : '暂无', meta: '' },
+      streamRow(full),
       { id: 'err', title: h.last_error?.time ? `最近异常 ${h.last_error.time}` : '暂无异常', subtitle: (h.last_error?.error ?? '').slice(0, 120), meta: '' },
     ],
   });

@@ -1,6 +1,6 @@
 {
   "name": "openchamber-muse-proxy",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "muse 分流代理状态：节点、探活、异常 + 一键换节点",
   "private": true,
   "type": "module",
@@ -18,13 +18,6 @@
         "entry": "service/main.js",
         "runtime": "host",
         "permissions": { "exec": ["systemctl", "python3"] }
-      },
-      "statusSection": {
-        "source": {
-          "path": "/status",
-          "interval": 5000
-        },
-        "title": "Muse 代理"
       },
       "panel": {
         "entry": "panel/index.html",

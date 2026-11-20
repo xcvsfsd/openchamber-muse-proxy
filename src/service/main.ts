@@ -1,5 +1,5 @@
-// muse-proxy 状态服务：轮询本地分流代理，给状态条和面板供数，承接换节点/探活操作。
-// 跑在 host，无沙箱；状态历史落盘到家目录，不放在包里（包内写入会触发重载）。
+// muse-proxy 状态服务：轮询本地分流代理，给小面板（statusSection）供数，承接换节点等操作。
+// 跑在 host，无沙箱；Clash 测速结果落盘到家目录，不放在包里（包内写入会触发重载）。
 import http from 'node:http';
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -10,7 +10,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 const TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
 const BASE = process.env.MUSE_PROXY_BASE ?? 'http://127.0.0.1:8788';
-const POLL_MS = 15_000;
+const POLL_MS = 5_000; // 面板 1s 一刷，底数 5s 一更（节点/探活变化跟手，本地开销可忽略）
 const STATE_FILE = join(homedir(), '.config', 'openchamber-muse-proxy', 'state.json');
 
 // 插件版本号：运行时读包内 package.json，面板底部展示（写死容易忘改）

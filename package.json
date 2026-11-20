@@ -1,6 +1,6 @@
 {
   "name": "openchamber-muse-proxy",
-  "version": "0.17.0",
+  "version": "0.34.0",
   "description": "muse 分流代理状态：节点、探活、异常 + 一键换节点",
   "private": true,
   "type": "module",
@@ -11,7 +11,7 @@
       "openchamber": ">=2.7.2"
     },
     "id": "muse-proxy",
-    "name": "Muse 代理",
+    "name": "网络代理",
     "icon": "assets/icon.svg",
     "contributes": {
       "service": {
@@ -19,15 +19,15 @@
         "runtime": "host",
         "permissions": { "exec": ["systemctl", "python3"] }
       },
-      "panel": {
-        "entry": "panel/index.html",
-        "name": "Muse 代理",
-        "icon": "wifi"
+      "statusSection": {
+        "entry": "status/index.html",
+        "title": "网络代理",
+        "height": 340
       }
     }
   },
   "scripts": {
-    "build": "bunx openchamber-guest-bundle src/panel/main.ts panel/main.js && bunx openchamber-guest-bundle --node src/service/main.ts service/main.js",
+    "build": "bunx openchamber-guest-bundle src/status/main.ts status/main.js && bunx openchamber-guest-bundle --node src/service/main.ts service/main.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

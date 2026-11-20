@@ -3,12 +3,17 @@ import { connectHost } from '@openchamber/sdk';
 import { applyHostReady, mountBadge, mountButton, mountPopoverAnchor, mountSeparator, mountText } from '@openchamber/sdk/ui';
 
 const host = connectHost();
+
+// 标题栏控件回调必须同步注册：点网速=立即刷新；状态只读展示，点按无动作
+host.onStatusControl((e) => {
+  if (e.id === 'net') void load(true);
+});
 const root = document.querySelector<HTMLElement>('#root')!;
 root.style.padding = '12px';
 root.style.display = 'flex';
 root.style.flexDirection = 'column';
-root.style.gap = '10px';
-root.style.fontSize = '15px';
+root.style.gap = '6px';
+root.style.fontSize = '13px';
 
 const stateBox = document.createElement('div');
 root.append(stateBox);
@@ -16,9 +21,9 @@ root.append(stateBox);
 // 分区头：标题（大字）+ 右侧操作按钮，按钮与内容在一起
 function sectionHead(box: HTMLElement, title: string) {
   const head = document.createElement('div');
-  head.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px;';
+  head.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;';
   const t = document.createElement('div');
-  t.style.cssText = 'font-size:16px;font-weight:700;margin-right:auto;';
+  t.style.cssText = 'font-size:14px;font-weight:700;margin-right:auto;';
   t.textContent = title;
   head.appendChild(t);
   box.appendChild(head);
@@ -30,13 +35,13 @@ function sectionHead(box: HTMLElement, title: string) {
 // 状态区两行常驻行：节点行 + 进程行，按钮嵌在行尾（只建一次，刷新只改字）
 function liveRow(body: HTMLElement) {
   const d = document.createElement('div');
-  d.style.cssText = 'display:flex;gap:8px;align-items:center;padding:7px 4px;border-bottom:1px solid var(--oc-sdk-edge);';
+  d.style.cssText = 'display:flex;gap:8px;align-items:center;padding:4px;border-bottom:1px solid var(--oc-sdk-edge);';
   const tx = document.createElement('div');
   tx.style.cssText = 'flex:1;min-width:0;';
   const m = document.createElement('div');
-  m.style.cssText = 'font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+  m.style.cssText = 'font-size:13px;font-weight:600;word-break:break-all;';
   const s = document.createElement('div');
-  s.style.cssText = 'font-size:13px;opacity:0.7;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+  s.style.cssText = 'font-size:12px;opacity:0.7;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
   tx.append(m, s);
   const slot = document.createElement('div');
   slot.style.cssText = 'display:flex;gap:6px;flex-shrink:0;align-items:center;';
@@ -45,10 +50,13 @@ function liveRow(body: HTMLElement) {
   return { row: d, tx, main: m, sub: s, slot };
 }
 
-const stateSec = sectionHead(stateBox, '状态');
-// 徽标紧跟在状态后
-(stateSec.head.firstElementChild as HTMLElement).style.marginRight = '0';
-const statusBadge = mountBadge(stateSec.head, { label: '…', tone: 'neutral' });
+const stateSec = sectionHead(stateBox, '');
+(stateSec.head.firstElementChild as HTMLElement).style.display = 'none';
+// 徽标紧跟在状态后（宿主支持标题栏控件时整体隐藏，改走标题栏展示）
+const titleMeta = document.createElement('div');
+titleMeta.style.cssText = 'display:flex;gap:8px;align-items:center;';
+stateSec.head.appendChild(titleMeta);
+const statusBadge = mountBadge(titleMeta, { label: '…', tone: 'neutral' });
 mountSeparator(stateSec.body, {});
 const nodeLine = liveRow(stateSec.body);
 // Clash Top 下拉区：默认收起，点节点行展开；挂在节点行下、进程行上
@@ -68,34 +76,50 @@ procLine.tx.style.cursor = 'pointer';
 procLine.tx.title = '展开/收起日志';
 procLine.tx.addEventListener('click', () => { flowOpen = !flowOpen; void load(true); });
 
-// 底部栏：上次刷新时间 + 版本号（常驻，只改字）
-const footBox = document.createElement('div');
-root.appendChild(footBox);
-mountSeparator(footBox, {});
-const footText = document.createElement('div');
-footText.style.cssText = 'font-size:12px;opacity:0.6;padding:2px 4px;';
-footBox.appendChild(footText);
-let pkgVersion = '';
-let lastRefreshAt = '';
-function paintFoot() {
-  footText.textContent = `上次刷新：${lastRefreshAt || '—'} · 版本号：${pkgVersion || '—'}`;
-}
-paintFoot();
 // 开关状态（内存，默认收起；刷出新 Top 后自动展开一次）
 let clashOpen = false;
 nodeLine.tx.style.cursor = 'pointer';
 nodeLine.tx.title = '展开/收起 Clash 测速 Top';
 nodeLine.tx.addEventListener('click', () => { clashOpen = !clashOpen; void load(true); });
 
-// 网速信息跟在 状态/徽标 后面（小字弱化，每轮改字）
+// 网速信息跟在 状态/徽标 后面（小字弱化，每轮改字；标题栏可用时隐藏）
 const trafficInfo = document.createElement('div');
-trafficInfo.style.cssText = 'font-size:13px;opacity:0.75;font-family:monospace;white-space:nowrap;';
-stateSec.head.appendChild(trafficInfo);
+trafficInfo.style.cssText = 'font-size:12px;opacity:0.75;font-family:monospace;white-space:nowrap;';
+titleMeta.appendChild(trafficInfo);
 
 async function req(path: string, method = 'GET', body?: unknown) {
   const r = await host.serviceRequest({ method: method as 'GET', path, body: body ? JSON.stringify(body) : undefined });
   return { status: r.status, json: r.body ? JSON.parse(r.body) : null };
 }
+
+// 状态图标 + 网速各占一个标题栏控件（与 git 插件一致；每个限宽 5rem，分开才放得下）
+let titleControlsOK = false;
+let lastStateIcon = '✓';
+let lastSpeeds = '—';
+async function publishTitleControls(stateIcon: string, speeds: string): Promise<void> {
+  lastStateIcon = stateIcon;
+  lastSpeeds = speeds;
+  try {
+    await host.setStatusControls([
+      { kind: 'button' as const, id: 'state', label: stateIcon },
+      { kind: 'button' as const, id: 'net', label: speeds },
+    ]);
+    if (!titleControlsOK) {
+      titleControlsOK = true;
+      titleMeta.style.display = 'none'; // 改走标题栏，区内隐藏
+    }
+  } catch {
+    if (titleControlsOK) {
+      titleControlsOK = false;
+      titleMeta.style.display = ''; // 老宿主退回区内展示
+    }
+  }
+}
+
+// 切目录后宿主会清空标题栏控件，重新发布一次
+host.onDirectory(() => {
+  if (titleControlsOK) void publishTitleControls(lastStateIcon, lastSpeeds);
+});
 
 function busy(btn: { update: (p: object) => void }, fn: () => Promise<void>) {
   return async () => {
@@ -104,28 +128,30 @@ function busy(btn: { update: (p: object) => void }, fn: () => Promise<void>) {
   };
 }
 
-// SDK 只有主题色/红色 variant，绿/蓝直接盖行内样式（loading 重绘不碰 style，常驻有效）
-function toneBtn(slot: HTMLElement, bg: string) {
+// 纯图标按钮：去背景无边框（与git标题栏↻一致）
+function plainBtn(slot: HTMLElement) {
   const el = slot.querySelector('button');
   if (el) {
     const h = el as HTMLElement;
-    h.style.background = bg;
+    h.style.background = 'transparent';
     h.style.borderColor = 'transparent';
-    h.style.color = '#fff';
+    h.style.color = 'inherit';
   }
 }
 
+procLine.slot.title = '重启/拉起代理进程';
 const svcBtn = mountButton(procLine.slot, {
-  label: '重启/拉起', variant: 'destructive', size: 'sm',
+  label: '↻', variant: 'destructive', size: 'xs',
   onClick: busy({ update: (p) => svcBtn.update(p) }, () => act('/status', { id: 'svc' }, '已执行')),
 });
-toneBtn(procLine.slot, '#2563eb'); // 蓝色
+plainBtn(procLine.slot);
+nodeLine.slot.title = 'Clash刷新：订阅更新 + 全组测速，刷完自动切最快';
 const clashBtn = mountButton(nodeLine.slot, {
-  label: 'Clash刷新', variant: 'destructive', size: 'sm',
+  label: '↻', variant: 'destructive', size: 'xs',
   // 订阅更新 + 全组测速约 10-20s，刷完自动切最快并展开下拉
   onClick: busy({ update: (p: object) => clashBtn.update(p) }, clashRefresh),
 });
-toneBtn(nodeLine.slot, '#16a34a'); // 绿色
+plainBtn(nodeLine.slot);
 
 async function clashRefresh() {
   try {
@@ -215,20 +241,22 @@ type Full = {
   process?: { listening: boolean; systemd: string; unit: boolean };
 };
 
-const fmtRate = (v: number | null | undefined) => {
-  if (v === null || v === undefined) return '—';
-  if (v < 1024) return `${Math.round(v)}B/s`;
-  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)}KB/s`;
-  return `${(v / 1024 / 1024).toFixed(2)}MB/s`;
-};
+const kb = (v: number | null | undefined) => String(Math.max(0, Math.round((v ?? 0) / 1024)));
 
 // 网速一行：标题直接带上下行速率 + 累计总量
+function speedsText(t?: Traffic): string {
+  if (!t) return '—';
+  return `↑ ${kb(t.up_rate)} ↓ ${kb(t.down_rate)}`;
+}
+
+// 标题栏每控件限宽 5rem，紧凑无空格才放得下
+function titleSpeeds(t?: Traffic): string {
+  if (!t) return '—';
+  return `↑${kb(t.up_rate)}↓${kb(t.down_rate)}`;
+}
+
 function drawTrafficInfo(t?: Traffic) {
-  if (!t) {
-    trafficInfo.textContent = '暂无数据';
-    return;
-  }
-  trafficInfo.textContent = `↑ ${fmtRate(t.up_rate)} ↓ ${fmtRate(t.down_rate)} 🌴 ${humanBytes(t.up_bytes + t.down_bytes)}`;
+  trafficInfo.textContent = t ? `${speedsText(t)} +${humanBytes(t.up_bytes + t.down_bytes)}` : '暂无数据';
 }
 
 const ms = (v: number | null | undefined) => {
@@ -242,37 +270,35 @@ async function load(force = false) {
     const f = await req('/full');
     if (f.status !== 200 || !f.json) throw new Error(`full http-${f.status}`);
     const full = f.json as Full;
-    if (full.version) pkgVersion = full.version;
     draw(full, force);
-    const d = new Date();
-    const p2 = (n: number) => String(n).padStart(2, '0');
-    lastRefreshAt = `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
-    paintFoot();
   } catch (e) {
-    stateSec.body.textContent = '';
-    note(stateSec.body, `服务不可用：${e instanceof Error ? e.message : e}`);
+    nodeLine.main.textContent = '▸ 服务不可用';
+    nodeLine.sub.textContent = e instanceof Error ? e.message : String(e);
+    procLine.main.textContent = '▸ 代理服务 · 未知';
+    procLine.sub.textContent = '';
+    trafficInfo.textContent = '—';
+    void publishTitleControls('?', '—');
   }
 }
 
 // 一行展示 + 移入浮框看全文。浮框走 host popover（surface=popover 时本页会重载为卡片模式）。
-// 老版本 host 不支持 popover 时，点一行用 toast 看全文（可复制）。
+// 点击不再弹框（移入浮框看全文；点 Top 行是切换节点，不受影响）。
 function hoverRow(time: string, text: string, full: { title: string; body: string }) {
   const row = document.createElement('div');
-  row.style.cssText = 'display:flex;gap:8px;align-items:baseline;padding:7px 4px;border-bottom:1px solid var(--oc-sdk-edge);';
+  row.style.cssText = 'display:flex;gap:8px;align-items:baseline;padding:4px;border-bottom:1px solid var(--oc-sdk-edge);';
   if (time) {
     const t = document.createElement('span');
-    t.style.cssText = 'font-family:monospace;white-space:nowrap;opacity:0.7;font-size:13px;';
+    t.style.cssText = 'font-family:monospace;white-space:nowrap;opacity:0.7;font-size:11px;';
     t.textContent = time;
     row.appendChild(t);
   }
   const tx = document.createElement('span');
-  tx.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;font-size:14px;';
+  tx.style.cssText = 'flex:1;font-size:12px;word-break:break-all;';
   row.appendChild(tx);
   mountText(tx, { text });
   try {
     mountPopoverAnchor(row, { host, getData: () => ({ ...full }), width: 380, height: 150 });
-  } catch { /* 老 host 不支持 popover，用下面的点击查看 */ }
-  row.addEventListener('click', () => void host.toast({ kind: 'info', message: full.body, copy: { text: full.body } }));
+  } catch { /* 不支持 popover 的宿主没有全文查看 */ }
   return row;
 }
 
@@ -335,7 +361,7 @@ function reqDetail(a: ReqActive | ReqRecent, active: boolean): { title: string; 
 // 小字提示行（14px）
 function note(body: HTMLElement, text: string) {
   const d = document.createElement('div');
-  d.style.cssText = 'font-size:14px;opacity:0.8;padding:4px 0;';
+  d.style.cssText = 'font-size:12px;opacity:0.8;padding:2px 0;';
   body.appendChild(d);
   mountText(d, { text });
 }
@@ -344,39 +370,43 @@ function note(body: HTMLElement, text: string) {
 function drawState(full: Full) {
   const h = full.health;
   nodeLine.main.textContent = `${clashOpen ? '▾' : '▸'} ${h.autoswitch?.now ?? '未知'}`;
-  nodeLine.sub.textContent = '策略组 ' + (h.autoswitch?.group ?? '-') + ' · ' + (h.at ?? '');
+  nodeLine.sub.textContent = '';
   const p = full.process;
   procLine.main.textContent = `${flowOpen ? '▾' : '▸'} 代理服务 · ` + (p ? (p.listening ? '运行中' : '已停止') : '未知');
   procLine.sub.textContent = '';
 }
 
-function drawFlow(h: Full['health']) {
+function drawFlow(items: (ReqActive | ReqRecent)[]) {
   if (!flowOpen) { flowDrop.style.display = 'none'; return; }
   flowDrop.style.display = '';
   flowDrop.textContent = '';
-  const actives = (h.requests?.active ?? []).filter((a) => !a.path.startsWith('/zen/go/v1/responses'));
-  const recents = (h.requests?.recent ?? []).filter((r) => !r.path.startsWith('/zen/go/v1/responses')).slice(0, 5);
-  if (actives.length === 0 && recents.length === 0) {
+  if (items.length === 0) {
     note(flowDrop, '当前空闲：无在途请求（opencode 还没发请求，或重启后记录已清零）');
     return;
   }
   const wrap = document.createElement('div');
   flowDrop.appendChild(wrap);
-  for (const a of actives) {
+  for (const a of items.filter((r): r is ReqActive => 'stage' in r)) {
     const stuck = isStuck(a);
     const title = `#${a.sid} ${stuck ? '⚠ ' : ''}${a.method} ${shortPath(a.path)} · ${a.stage}${stuck ? '（可能卡住）' : ''}`;
     const sub = `已耗时${a.elapsed_s}s · 本阶段${a.stuck_s}s · 已收${humanBytes(a.sent)} · ${a.route}${a.model ? ` · ${a.model}` : ''}`;
     const row = hoverRow('', `${title.slice(0, 64)} — ${sub}`.slice(0, 96), reqDetail(a, true));
-    if (stuck) row.style.background = 'color-mix(in srgb, var(--destructive) 12%, transparent)';
+    if (stuck) {
+      row.style.background = 'color-mix(in srgb, var(--destructive) 12%, transparent)';
+      row.style.color = 'var(--destructive, #ef4444)';
+    }
     wrap.appendChild(row);
   }
-  for (const r of recents) {
+  for (const r of items.filter((r): r is ReqRecent => !('stage' in r))) {
     const icon = r.outcome === 'ok' ? '✓' : r.outcome === 'warn' ? '○' : '✗';
     const title = `#${r.sid} ${icon} ${r.method} ${shortPath(r.path)} · 用时${r.total_s}s · 首字节${ms(r.first_ms)}`;
     const sub = `${r.route}${r.model ? ` · ${r.model}` : ''} · ${humanBytes(r.bytes)}${r.error ? ` · ${r.error.slice(0, 40)}` : ''}`;
     const row = hoverRow('', `${title.slice(0, 64)} — ${sub}`.slice(0, 96), reqDetail(r, false));
     row.style.opacity = r.outcome === 'ok' ? '0.85' : '1';
-    if (r.outcome === 'error') row.style.background = 'color-mix(in srgb, var(--destructive) 12%, transparent)';
+    if (r.outcome === 'error') {
+      row.style.background = 'color-mix(in srgb, var(--destructive) 12%, transparent)';
+      row.style.color = 'var(--destructive, #ef4444)'; // 整行红字
+    }
     wrap.appendChild(row);
   }
 }
@@ -394,12 +424,12 @@ function drawClash(full: Full) {
   clashList.appendChild(wrap);
   c.top.forEach((t, i) => {
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex;gap:8px;align-items:baseline;padding:7px 4px;border-bottom:1px solid var(--oc-sdk-edge);cursor:pointer;';
+    row.style.cssText = 'display:flex;gap:8px;align-items:baseline;padding:4px;border-bottom:1px solid var(--oc-sdk-edge);cursor:pointer;';
     const rank = document.createElement('span');
-    rank.style.cssText = 'font-family:monospace;opacity:0.7;font-size:13px;';
+    rank.style.cssText = 'font-family:monospace;opacity:0.7;font-size:11px;';
     rank.textContent = `#${i + 1}`;
     const tx = document.createElement('span');
-    tx.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;font-size:14px;';
+    tx.style.cssText = 'flex:1;font-size:12px;word-break:break-all;';
     row.append(rank, tx);
     mountText(tx, { text: `${t.name} — ${t.delay_ms}ms${t.blocked ? '（禁用）' : ''}` });
     row.title = `切换到 ${t.name}`;
@@ -419,20 +449,26 @@ function draw(full: Full, force = false) {
     trafficInfo.textContent = '（代理不可达）';
     clashDrop.style.display = 'none';
     flowDrop.style.display = 'none';
+    void publishTitleControls('!', '—');
     return;
   }
-  const stuckN = (h.requests?.active ?? []).filter(isStuck).length;
+  const shown = [...(h.requests?.active ?? []), ...(h.requests?.recent ?? [])]
+    .sort((a, b) => Number(b.sid) - Number(a.sid)).slice(0, 5);
+  const shownActives = shown.filter((r): r is ReqActive => 'stage' in r);
+  const stuckN = shownActives.filter(isStuck).length;
   const bad = h.autoswitch?.now_blocked || h.preflight?.ok === false;
+  const stateLabel = stuckN > 0 ? '⚠' : bad ? '✗' : '✓';
   if (stuckN > 0) statusBadge.update({ label: `可能卡住×${stuckN}`, tone: 'error' });
   else statusBadge.update({ label: bad ? '异常' : '正常', tone: bad ? 'error' : 'success' });
 
   drawState(full);
   drawTrafficInfo(h.traffic);
+  void publishTitleControls(stateLabel, titleSpeeds(h.traffic));
 
   // 鼠标正停在各区看浮框时不重建 DOM，否则锚点被删导致浮框反复开关
   if (hovering && !force) return;
 
-  drawFlow(h);
+  drawFlow(shown);
   drawClash(full);
   try {
     const hgt = Math.min(700, Math.ceil(root.getBoundingClientRect().height));
@@ -443,7 +479,7 @@ function draw(full: Full, force = false) {
   } catch { /* 非面板表面忽略 */ }
 }
 
-// 自动刷新 2s 一次（网速/日志要跟手）。鼠标停在各区时跳过重建（浮框开着），
+// 自动刷新 1s 一次（网速/状态/日志同频）。鼠标停在各区时跳过重建（浮框开着），
 // 鼠标离开后再刷一次；手动操作后强制刷一次。
 let hovering = false;
 let lastHeight = 0;
@@ -466,7 +502,7 @@ host.onReady((context) => {
   if (booted) { void load(); return; }
   booted = true;
   void load();
-  setInterval(() => { void load(); }, 2000);
+  setInterval(() => { void load(); }, 1000);
 });
 void clashBtn;
 void svcBtn;

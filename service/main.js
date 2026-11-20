@@ -11,7 +11,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 var PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 var TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
 var BASE = process.env.MUSE_PROXY_BASE ?? "http://127.0.0.1:8788";
-var POLL_MS = 15000;
+var POLL_MS = 5000;
 var STATE_FILE = join(homedir(), ".config", "openchamber-muse-proxy", "state.json");
 var PKG_VERSION = (() => {
   try {

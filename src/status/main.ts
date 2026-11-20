@@ -265,6 +265,12 @@ const ms = (v: number | null | undefined) => {
   return `${(v / 1000).toFixed(1)}s`;
 };
 
+// 模型名只显示头部第一个单词：muse-spark → muse，deepseek-chat → deepseek
+const shortModel = (m: string): string => (m || '').split(/[-_ ]/)[0] || '—';
+
+// 节点名只显示 | 分隔的第一段：🇺🇸美国洛杉矶02|流媒体|0.01x → 🇺🇸美国洛杉矶02
+const shortNode = (n: string): string => (n || '').split('|')[0] || '未知';
+
 async function load(force = false) {
   try {
     const f = await req('/full');
@@ -329,11 +335,6 @@ function humanBytes(n: number): string {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)}GB`;
 }
 
-function shortPath(p: string): string {
-  const noQ = p.split('?')[0];
-  return noQ.length > 42 ? `…${noQ.slice(-41)}` : noQ;
-}
-
 // 卡住判定：在途请求停在某个阶段太久（等首字节>20s / 建连>15s / 任一阶段>120s / 总耗时>300s）
 function isStuck(a: ReqActive): boolean {
   if (a.stage === '等上游首字节' && a.stuck_s > 20) return true;
@@ -342,11 +343,15 @@ function isStuck(a: ReqActive): boolean {
   return false;
 }
 
+// 敏感地址打码：行保留、照常计数，只是不显示该地址
+const HIDE_PREFIX = '/zen/go/v1/responses';
+const masked = (a: ReqActive | ReqRecent): boolean => a.path.startsWith(HIDE_PREFIX);
+
 function reqDetail(a: ReqActive | ReqRecent, active: boolean): { title: string; body: string } {
   const first = 'e2e_first_ms' in a ? (a as ReqActive).e2e_first_ms : (a as ReqRecent).first_ms;
   const up = 'up_first_ms' in a ? (a as ReqActive).up_first_ms : (a as ReqRecent).up_ms;
   const body = [
-    `#${a.sid} ${a.method} ${a.path}`,
+    masked(a) ? `#${a.sid}（地址已隐藏）` : `#${a.sid} ${a.method} ${a.path}`,
     `模型 ${a.model || '—'} · 路由 ${a.route}`,
     active
       ? `阶段 ${(a as ReqActive).stage} · 已耗时 ${(a as ReqActive).elapsed_s}s · 本阶段停留 ${(a as ReqActive).stuck_s}s`
@@ -369,7 +374,7 @@ function note(body: HTMLElement, text: string) {
 // 状态区两行只改字不重建（按钮常驻行尾）
 function drawState(full: Full) {
   const h = full.health;
-  nodeLine.main.textContent = `${clashOpen ? '▾' : '▸'} ${h.autoswitch?.now ?? '未知'}`;
+  nodeLine.main.textContent = `${clashOpen ? '▾' : '▸'} ${shortNode(h.autoswitch?.now ?? '')}`;
   nodeLine.sub.textContent = '';
   const p = full.process;
   procLine.main.textContent = `${flowOpen ? '▾' : '▸'} 代理服务 · ` + (p ? (p.listening ? '运行中' : '已停止') : '未知');
@@ -388,9 +393,11 @@ function drawFlow(items: (ReqActive | ReqRecent)[]) {
   flowDrop.appendChild(wrap);
   for (const a of items.filter((r): r is ReqActive => 'stage' in r)) {
     const stuck = isStuck(a);
-    const title = `#${a.sid} ${stuck ? '⚠ ' : ''}${a.method} ${shortPath(a.path)} · ${a.stage}${stuck ? '（可能卡住）' : ''}`;
-    const sub = `已耗时${a.elapsed_s}s · 本阶段${a.stuck_s}s · 已收${humanBytes(a.sent)} · ${a.route}${a.model ? ` · ${a.model}` : ''}`;
-    const row = hoverRow('', `${title.slice(0, 64)} — ${sub}`.slice(0, 96), reqDetail(a, true));
+    const parts = [`#${a.sid}`];
+    if (stuck) parts.push('⚠');
+    parts.push(a.stage, `${a.elapsed_s}s`, humanBytes(a.sent));
+    if (a.model) parts.push(shortModel(a.model));
+    const row = hoverRow('', parts.join(' ').slice(0, 96), reqDetail(a, true));
     if (stuck) {
       row.style.background = 'color-mix(in srgb, var(--destructive) 12%, transparent)';
       row.style.color = 'var(--destructive, #ef4444)';
@@ -399,9 +406,9 @@ function drawFlow(items: (ReqActive | ReqRecent)[]) {
   }
   for (const r of items.filter((r): r is ReqRecent => !('stage' in r))) {
     const icon = r.outcome === 'ok' ? '✓' : r.outcome === 'warn' ? '○' : '✗';
-    const title = `#${r.sid} ${icon} ${r.method} ${shortPath(r.path)} · 用时${r.total_s}s · 首字节${ms(r.first_ms)}`;
-    const sub = `${r.route}${r.model ? ` · ${r.model}` : ''} · ${humanBytes(r.bytes)}${r.error ? ` · ${r.error.slice(0, 40)}` : ''}`;
-    const row = hoverRow('', `${title.slice(0, 64)} — ${sub}`.slice(0, 96), reqDetail(r, false));
+    const parts = [`#${r.sid}`, icon, `${r.total_s}s`, humanBytes(r.bytes ?? 0)];
+    if (r.model) parts.push(shortModel(r.model));
+    const row = hoverRow('', parts.join(' ').slice(0, 96), reqDetail(r, false));
     row.style.opacity = r.outcome === 'ok' ? '0.85' : '1';
     if (r.outcome === 'error') {
       row.style.background = 'color-mix(in srgb, var(--destructive) 12%, transparent)';
@@ -431,8 +438,8 @@ function drawClash(full: Full) {
     const tx = document.createElement('span');
     tx.style.cssText = 'flex:1;font-size:12px;word-break:break-all;';
     row.append(rank, tx);
-    mountText(tx, { text: `${t.name} — ${t.delay_ms}ms${t.blocked ? '（禁用）' : ''}` });
-    row.title = `切换到 ${t.name}`;
+    mountText(tx, { text: `${shortNode(t.name)} — ${t.delay_ms}ms` });
+    row.title = `切换到 ${t.name}（${t.delay_ms}ms）`;
     row.addEventListener('click', () => void switchToNode(t.name));
     wrap.appendChild(row);
   });

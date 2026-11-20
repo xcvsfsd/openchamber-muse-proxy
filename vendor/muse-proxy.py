@@ -18,6 +18,7 @@ muse 链路额外做三件事：
 健康检查: curl http://127.0.0.1:8788/__health
 """
 import argparse
+import concurrent.futures
 import http.client
 import http.server
 import json
@@ -29,6 +30,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
 
 DEFAULT_PORT = 8788
 DEFAULT_UPSTREAM = "opencode.ai"
@@ -80,6 +82,14 @@ BLOCK_KEYWORDS = [
     ).split(",") if k.strip()
 ]
 
+# Clash 刷新（/__clash-refresh 用）：订阅更新 + 节点测速
+CLASH_TEST_URL = os.environ.get(
+    "MUSE_PROXY_CLASH_TEST_URL", "http://cp.cloudflare.com/generate_204")
+CLASH_TEST_TIMEOUT = _env_int("MUSE_PROXY_CLASH_TEST_TIMEOUT", 4)  # 单节点测速秒
+CLASH_TOP_N = _env_int("MUSE_PROXY_CLASH_TOP_N", 5)  # 取前 N 个最快
+# 测速时跳过的非真实节点（流量显示/套餐显示/功能位）
+SKIP_NODES = ("DIRECT", "REJECT", "GLOBAL", "自动选择", "故障转移")
+
 CFG = {"port": DEFAULT_PORT, "upstream": DEFAULT_UPSTREAM, "proxy": DEFAULT_PROXY}
 
 # 最近一次异常，/__health 里能看到，方便事后确认是不是本地这一跳出的问题
@@ -96,69 +106,161 @@ PROBER = {"runs": 0, "failures": 0, "last_run": ""}
 
 _STATE_LOCK = threading.Lock()
 
-# 流统计：面板要的实时指标，只记内存（重启清零）
-STATS = {
-    "seq": 0,
-    "active": {},           # sid -> start_ts
-    "closed": 0,            # 已关闭流累计
-    "last_closed_s": 0.0,   # 上一条关闭流持续秒
-    "errors": 0,            # 错误响应 + 流中断累计
-    "last_e2e_first_ms": None,  # 上条端到端首字节：收到请求→首字节发给客户端
-    "last_up_first_ms": None,   # 上条上游首字节：收到请求→上游响应头
+# 请求序号：#sid 唯一标识来源，只记内存（重启清零）
+REQ_SEQ = 0
+
+
+# 流量统计：实时网速 + 累计流量（只记内存，重启清零）
+# up = 收到请求体（客户端→代理），down = 发出响应体（代理→客户端）
+TRAFFIC = {
+    "up": 0, "down": 0,
+    "up_muse": 0, "down_muse": 0,
+    "events": deque(maxlen=1200),  # (ts, up_n, down_n)，算窗口速率用
 }
+TRAFFIC_WINDOW = 5.0  # 速率窗口秒（面板 5s 轮询一次，正好对齐）
 
 
-def stat_start() -> str:
+def traffic_add(up_n: int, down_n: int, muse: bool) -> None:
+    now = time.time()
     with _STATE_LOCK:
-        STATS["seq"] += 1
-        sid = str(STATS["seq"])
-        STATS["active"][sid] = time.time()
+        TRAFFIC["up"] += up_n
+        TRAFFIC["down"] += down_n
+        if muse:
+            TRAFFIC["up_muse"] += up_n
+            TRAFFIC["down_muse"] += down_n
+        if up_n or down_n:
+            TRAFFIC["events"].append((now, up_n, down_n))
+
+
+def traffic_snapshot():
+    now = time.time()
+    with _STATE_LOCK:
+        ev = [e for e in TRAFFIC["events"] if now - e[0] <= TRAFFIC_WINDOW]
+        up = sum(e[1] for e in ev)
+        down = sum(e[2] for e in ev)
+        return {
+            "up_bytes": TRAFFIC["up"], "down_bytes": TRAFFIC["down"],
+            "up_muse": TRAFFIC["up_muse"], "down_muse": TRAFFIC["down_muse"],
+            "up_rate": round(up / TRAFFIC_WINDOW, 1),
+            "down_rate": round(down / TRAFFIC_WINDOW, 1),
+            "window_s": TRAFFIC_WINDOW,
+        }
+# stage 流转：收请求 → 建连中 → 等上游首字节 → 流式传输 → 完成/失败
+# 实时流程：每条转发请求的阶段追踪（面板判断卡住/失败用，只记内存，重启清零）
+# stage 流转：收请求 → 建连中 → 等上游首字节 → 流式传输 → 完成/失败
+REQS_ACTIVE = {}           # sid -> entry（在途）
+REQS_RECENT = deque(maxlen=20)  # 已完成（新在前）
+
+
+def _stamp_full() -> str:
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def req_begin(method: str, path: str, model: str, route: str) -> str:
+    """登记一条新请求，返回 sid（#N，面板唯一标识）。"""
+    global REQ_SEQ
+    now = time.time()
+    with _STATE_LOCK:
+        REQ_SEQ += 1
+        sid = str(REQ_SEQ)
+        REQS_ACTIVE[sid] = {
+            "sid": sid, "start": now, "stage": "收请求", "stage_ts": now,
+            "method": method, "path": path[:120], "model": model[:60],
+            "route": route, "connect_ms": None,
+            "up_first_ms": None, "e2e_first_ms": None, "sent": 0,
+        }
     return sid
 
 
-def stat_drop(sid: str) -> None:
+def req_stage(sid: str, stage: str, route=None) -> None:
     with _STATE_LOCK:
-        STATS["active"].pop(sid, None)
+        e = REQS_ACTIVE.get(sid)
+        if e is not None:
+            e["stage"] = stage
+            e["stage_ts"] = time.time()
+            if route:
+                e["route"] = route
 
 
-def stat_up_first(sid: str) -> None:
+def req_mark_connect(sid: str) -> None:
     with _STATE_LOCK:
-        start = STATS["active"].get(sid)
-        if start is not None:
-            STATS["last_up_first_ms"] = int((time.time() - start) * 1000)
+        e = REQS_ACTIVE.get(sid)
+        if e is not None:
+            e["connect_ms"] = int((time.time() - e["start"]) * 1000)
 
 
-def stat_e2e_first(sid: str) -> None:
+def req_mark_up(sid: str) -> None:
     with _STATE_LOCK:
-        start = STATS["active"].get(sid)
-        if start is not None:
-            STATS["last_e2e_first_ms"] = int((time.time() - start) * 1000)
+        e = REQS_ACTIVE.get(sid)
+        if e is not None:
+            e["up_first_ms"] = int((time.time() - e["start"]) * 1000)
 
 
-def stat_close(sid: str, bad: bool) -> None:
+def req_mark_e2e(sid: str) -> None:
+    with _STATE_LOCK:
+        e = REQS_ACTIVE.get(sid)
+        if e is not None:
+            e["e2e_first_ms"] = int((time.time() - e["start"]) * 1000)
+
+
+def req_progress(sid: str, n: int) -> None:
+    """流式传输中累加已发字节（面板在途行看进度用）。"""
+    with _STATE_LOCK:
+        e = REQS_ACTIVE.get(sid)
+        if e is not None:
+            e["sent"] += n
+
+
+def req_finish(sid: str, ok: bool, error: str = "", sent: int = 0,
+               outcome: str = "") -> None:
     now = time.time()
     with _STATE_LOCK:
-        start = STATS["active"].pop(sid, None)
-        if start is not None:
-            STATS["closed"] += 1
-            STATS["last_closed_s"] = round(now - start, 2)
-        if bad:
-            STATS["errors"] += 1
+        e = REQS_ACTIVE.pop(sid, None)
+        if e is None:
+            return
+        REQS_RECENT.appendleft({
+            "sid": sid, "at": _stamp_full(), "method": e["method"], "path": e["path"],
+            "model": e["model"], "route": e["route"],
+            "outcome": outcome or ("ok" if ok else "error"),
+            "total_s": round(now - e["start"], 2),
+            "first_ms": e["e2e_first_ms"], "up_ms": e["up_first_ms"],
+            "bytes": sent, "error": (error or "")[:300],
+        })
 
 
-def stat_snapshot():
+def req_oneshot(method: str, path: str, model: str, route: str,
+                ok: bool, error: str) -> None:
+    """建 sid 前就失败的请求（请求体坏/禁用节点无候选）：直接记一笔最近记录。"""
+    global REQ_SEQ
+    with _STATE_LOCK:
+        REQ_SEQ += 1
+        REQS_RECENT.appendleft({
+            "sid": str(REQ_SEQ), "at": _stamp_full(), "method": method, "path": path[:120],
+            "model": (model or "")[:60], "route": route,
+            "outcome": "ok" if ok else "error",
+            "total_s": 0, "first_ms": None, "up_ms": None,
+            "bytes": 0, "error": (error or "")[:300],
+        })
+
+
+def reqs_snapshot():
     now = time.time()
     with _STATE_LOCK:
-        act = list(STATS["active"].values())
-        return {
-            "active": len(act),
-            "longest_active_s": round(now - min(act), 1) if act else 0,
-            "closed": STATS["closed"],
-            "last_closed_s": STATS["last_closed_s"],
-            "errors": STATS["errors"],
-            "last_e2e_first_ms": STATS["last_e2e_first_ms"],
-            "last_up_first_ms": STATS["last_up_first_ms"],
-        }
+        active = [
+            {
+                "sid": e["sid"], "method": e["method"], "path": e["path"],
+                "model": e["model"], "route": e["route"], "stage": e["stage"],
+                "elapsed_s": round(now - e["start"], 1),
+                "stuck_s": round(now - e["stage_ts"], 1),
+                "connect_ms": e["connect_ms"],
+                "up_first_ms": e["up_first_ms"],
+                "e2e_first_ms": e["e2e_first_ms"], "sent": e["sent"],
+            }
+            for e in sorted(REQS_ACTIVE.values(), key=lambda x: x["start"])
+        ]
+        recent = list(REQS_RECENT)
+    return {"active": active, "recent": recent}
 
 
 def node_blocked(name: str) -> bool:
@@ -208,6 +310,22 @@ def ctl_call(path: str, payload=None):
     if sec:
         req.add_header("Authorization", f"Bearer {sec}")
     with urllib.request.urlopen(req, timeout=3) as r:
+        raw = r.read()
+        return json.loads(raw.decode()) if raw else {}
+
+
+def ctl_request(method: str, raw_path: str, payload=None, timeout: int = 5):
+    """带查询串的控制口调用（raw_path 里的 ?&= 不转义，给 delay 测速用）。"""
+    host, port = (CTL.split(":") + ["9097"])[:2]
+    url = f"http://{host}:{port}{raw_path}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    sec = ctl_secret()
+    if sec:
+        req.add_header("Authorization", f"Bearer {sec}")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()
         return json.loads(raw.decode()) if raw else {}
 
@@ -397,12 +515,6 @@ def explain_upstream(status: int, raw: bytes) -> str:
     return f"muse 上游 {status} {why}{hint}{tail}"
 
 
-# probe_proxy 已退役：探活只走后台线程 prober_loop，主流程只读 PROBE 缓存。
-def probe_proxy(_ctx=None, _force: bool = False):
-    """兼容空壳：直接返回缓存，不做任何网络动作。"""
-    return PROBE["ok"], PROBE["err"]
-
-
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "muse-proxy/1.7"
@@ -412,8 +524,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ---------- 异常要能让客户端看见（否则对话里就是一直转圈） ----------
     def send_proxy_error(self, status: int, message: str) -> None:
-        with _STATE_LOCK:
-            STATS["errors"] += 1
         payload = json.dumps({
             "error": {
                 "type": "muse_proxy_error",
@@ -421,6 +531,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "message": message,
             }
         }, ensure_ascii=False).encode()
+        traffic_add(0, len(payload), False)  # 错误响应体也算下行（路由未知，只记总量）
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -477,6 +588,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         model = str((data or {}).get("model") or "").lower()
         return model.startswith(MUSE_PREFIX)
 
+    @staticmethod
+    def model_of(body: bytes) -> str:
+        """请求体里的模型名（面板实时流程展示用，解析失败返回空）。"""
+        try:
+            data = json.loads(body.decode("utf-8", "replace"))
+            return str((data or {}).get("model") or "")
+        except Exception:
+            return ""
+
     # ---------- 健康检查 ----------
     def do_GET(self):
         if self.path == "/__health":
@@ -512,7 +632,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "now_blocked": node_blocked(GROUP["now"]),
                 },
                 "last_error": LAST,
-                "streams": stat_snapshot(),
+                "requests": reqs_snapshot(),
+                "traffic": traffic_snapshot(),
             }, ensure_ascii=False).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -600,6 +721,123 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "blocked": node_blocked(now), "elapsed": round(time.time() - t0, 2),
         })
 
+    # ---------- Clash 刷新：订阅更新 + 全组测速取 TopN ----------
+    @staticmethod
+    def _is_real_node(name: str) -> bool:
+        if not name or name in SKIP_NODES:
+            return False
+        return not (name.startswith("剩余流量") or name.startswith("套餐到期"))
+
+    def clash_delay(self, name: str):
+        """单个节点测速，返回 (name, delay_ms|None)。失败/超时记 None。"""
+        q = urllib.parse.quote(name, safe="")
+        u = urllib.parse.quote(CLASH_TEST_URL, safe="")
+        ms = int(CLASH_TEST_TIMEOUT * 1000)
+        try:
+            r = ctl_request("GET", f"/proxies/{q}/delay?timeout={ms}&url={u}",
+                            timeout=CLASH_TEST_TIMEOUT + 3)
+            d = r.get("delay")
+            return (name, d if isinstance(d, int) else None)
+        except Exception:
+            return (name, None)
+
+    def handle_clash_refresh(self) -> None:
+        """POST /__clash-refresh：订阅刷新 + 当前策略组全节点测速，返回最快 TopN。
+
+        步骤：逐个 PUT /providers/proxies/{名} 触发订阅更新 →
+        顺手触发一次 clash 自带 healthcheck（异步，不管结果）→
+        对当前组全部真实节点 10 并发打 delay → 按延迟排序取最快，
+        香港等禁用节点不进 Top（muse 不可用，进去也切不过去）。
+        """
+        t0 = time.time()
+        try:
+            providers = (ctl_request("GET", "/providers/proxies", timeout=8)
+                         or {}).get("providers") or {}
+        except Exception as e:
+            msg = f"控制口 {CTL} 不可达：{e}"
+            log(f"Clash 刷新失败：{msg}")
+            self.send_local_json(502, {"ok": False, "error": msg})
+            return
+        updated, upd_fail = [], []
+        for pname in providers.keys():
+            try:
+                ctl_request("PUT",
+                            f"/providers/proxies/{urllib.parse.quote(pname, safe='')}",
+                            timeout=10)
+                updated.append(pname)
+            except Exception as e:
+                upd_fail.append(f"{pname}：{e}")
+        # 触发 clash 自带健康检查（后台异步做，只为刷新它自己的 alive 状态）
+        try:
+            u = urllib.parse.quote(CLASH_TEST_URL, safe="")
+            ctl_request("GET",
+                        f"/providers/proxies/default/healthcheck?url={u}&timeout=5000",
+                        timeout=5)
+        except Exception:
+            pass
+        group, now = current_group(force=True)
+        if not group:
+            self.send_local_json(502, {
+                "ok": False, "error": "控制口不可达或组内无候选，找不到承载 muse 的策略组",
+                "providers_updated": updated, "providers_failed": upd_fail})
+            return
+        try:
+            alln = (ctl_call(f"/proxies/{group}") or {}).get("all") or []
+        except Exception as e:
+            self.send_local_json(502, {
+                "ok": False, "error": f"读组 {group} 失败：{e}",
+                "providers_updated": updated, "providers_failed": upd_fail})
+            return
+        candidates = [n for n in alln if self._is_real_node(n)]
+        results = []
+        if candidates:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+                futs = {ex.submit(self.clash_delay, n): n for n in candidates}
+                try:
+                    for f in concurrent.futures.as_completed(futs, timeout=90):
+                        try:
+                            results.append(f.result())
+                        except Exception:
+                            results.append((futs[f], None))
+                except Exception:
+                    pass  # 整体超时：有多少算多少
+        scored = sorted(((n, d) for n, d in results if d is not None),
+                        key=lambda x: x[1])
+        failed_n = sum(1 for _, d in results if d is None)
+        usable = [(n, d) for n, d in scored if not node_blocked(n)]
+        top = [{"name": n, "delay_ms": d, "blocked": False}
+               for n, d in usable[:CLASH_TOP_N]]
+        # 默认用最快：如果当前节点不是 Top1，自动切过去（只影响新建连接，在途流不受影响）
+        switched_to, switch_error = "", ""
+        if top:
+            want = top[0]["name"]
+            if now != want:
+                try:
+                    ctl_request("PUT",
+                                f"/proxies/{urllib.parse.quote(group, safe='')}",
+                                {"name": want}, timeout=5)
+                    with _STATE_LOCK:
+                        GROUP.update(ts=time.time(), group=group, now=want)
+                    switched_to = want
+                    log(f"Clash 刷新后自动切到最快节点 {group}: {now} → {want}")
+                except Exception as e:
+                    switch_error = f"{e.__class__.__name__}: {e}"
+                    log(f"自动切最快节点 {want} 失败({switch_error})，保持 {now}")
+        elapsed = round(time.time() - t0, 1)
+        log(f"Clash 刷新完成（{elapsed}s）：订阅更新 {len(updated)} 个，"
+            f"测速 {len(results)}/{len(candidates)}，"
+            f"Top{len(top)} {', '.join(f'{n} {d}ms' for n, d in usable[:CLASH_TOP_N]) or '无'}"
+            f"{'，已切 ' + switched_to if switched_to else ''}")
+        self.send_local_json(200, {
+            "ok": True, "group": group, "now": switched_to or now,
+            "elapsed": elapsed, "providers_updated": updated,
+            "providers_failed": upd_fail, "tested": len(results),
+            "failed_n": failed_n,
+            "blocked_skipped": len(scored) - len(usable),
+            "top": top,
+            "switched_to": switched_to, "switch_error": switch_error,
+        })
+
     # ---------- 转发 ----------
     def _open(self, via_proxy: bool, ctx):
         """建连(TCP+TLS+可选隧道)。"""
@@ -627,6 +865,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/__probe-now" and method == "POST":
             self.handle_probe_now()
             return
+        if self.path == "/__clash-refresh" and method == "POST":
+            self.handle_clash_refresh()
+            return
         if self.path.startswith("/__"):
             self.send_proxy_error(404, f"未知本地端点：{self.path}")
             return
@@ -637,11 +878,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg = f"muse-proxy 读取请求体失败（{BODY_READ_TIMEOUT}s 超时或格式错误）：{e}"
             log(f"[{method} {self.path}] {msg}")
             note_error(self.path, "-", msg)
+            req_oneshot(method, self.path, "", "-", False, msg)
             self.send_proxy_error(400, msg)
             return
 
         via_proxy = self.wants_proxy(body)
+        model = self.model_of(body)
         log(f"[{method} {self.path}] 收到 {len(body)}B → {'proxy' if via_proxy else 'direct'}")
+        traffic_add(len(body), 0, via_proxy)  # 上行：收到请求体即记
 
         ctx = ssl.create_default_context()
         headers = {
@@ -663,6 +907,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "且没有可用候选节点；去 Verge 手动换：美国01 → 伦敦01 → 新加坡专线01")
                     log(f"[{method} {self.path}] {msg}")
                     note_error(self.path, "proxy", msg)
+                    req_oneshot(method, self.path, model, "proxy", False, msg)
                     self.send_proxy_error(502, msg)
                     return
 
@@ -679,26 +924,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "去 Verge 换节点：美国01 → 伦敦01 → 新加坡专线01")
                     log(f"[{method} {self.path}] {msg}")
                     note_error(self.path, "proxy", msg)
+                    req_oneshot(method, self.path, model, "proxy", False, msg)
                     self.send_proxy_error(502, msg)
                     return
 
         # 2) 发请求；失败或 403 地区限制则换节点重试一次
         attempts = 0
         switched = ""
-        sid = stat_start()  # 从这里起算一条在用流；下面所有错误返回前都要先注销
+        sid = req_begin(method, self.path, model, "proxy" if via_proxy else "direct")  # 从这里起算一条在用请求；下面所有错误返回前都要先注销
         while True:
             attempts += 1
             stage = "建连" if via_proxy else "直连建连"
+            req_stage(sid, "建连中", "proxy" if via_proxy else "direct")
             conn = None
             try:
                 conn = self._open(via_proxy, ctx)
                 log(f"[{method} {self.path}] 上游已连接({time.time() - t0:.2f}s) "
                     f"{'经' + CFG['proxy'] if via_proxy else '直连'}")
+                req_mark_connect(sid)
+                req_stage(sid, "等上游首字节")
                 stage = "等待上游首字节"
                 conn.sock.settimeout(FIRST_BYTE_TIMEOUT)
                 conn.request(method, self.path, body=body or None, headers=headers)
                 resp = conn.getresponse()
-                stat_up_first(sid)
+                req_mark_up(sid)
             except Exception as e:
                 if via_proxy and attempts == 1 and AUTOSWITCH:
                     node = switch_node(exclude=(switched,) if switched else ())
@@ -723,14 +972,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         conn.sock.settimeout(FIRST_BYTE_TIMEOUT)
                         conn.request(method, self.path, body=body or None, headers=headers)
                         resp = conn.getresponse()
-                        stat_up_first(sid)
+                        req_mark_up(sid)
+                        req_stage(sid, "等上游首字节", "direct")
                         log(f"[{method} {self.path}] 上游已连接({time.time() - t0:.2f}s) 直连(降级)")
                     except Exception as e2:
                         msg = (f"muse-proxy 连不上上游（代理不可用，直连 {CFG['upstream']} 也失败）："
                                f"{e2}；检查 Clash 是否运行、节点是否可用")
                         log(f"[{method} {self.path}] {msg}")
                         note_error(self.path, "direct", msg)
-                        stat_drop(sid)
+                        req_finish(sid, False, msg)
                         self.send_proxy_error(502, msg)
                         return
                 else:
@@ -738,7 +988,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            f"（{FIRST_BYTE_TIMEOUT}s 内上游无数据则为上游/节点卡住）")
                     log(f"[{method} {self.path}] {msg}")
                     note_error(self.path, "direct", msg)
-                    stat_drop(sid)
+                    req_finish(sid, False, msg)
                     self.send_proxy_error(504 if stage == "等待上游首字节" else 502, msg)
                     return
 
@@ -762,7 +1012,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     conn.close()
                 except Exception:
                     pass
-                stat_drop(sid)
+                req_finish(sid, False, msg)
                 self.send_proxy_error(403, msg)
                 return
             break
@@ -783,7 +1033,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.close()
             except Exception:
                 pass
-            stat_drop(sid)
+            req_finish(sid, False, msg)
             self.send_proxy_error(resp.status, msg)
             return
 
@@ -796,7 +1046,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
         self.wfile.flush()
-        stat_e2e_first(sid)  # 首字节已发出：端到端首字节
+        req_mark_e2e(sid)  # 首字节已发出：端到端首字节
+        req_stage(sid, "流式传输")
 
         sent = 0
         err = None
@@ -809,6 +1060,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                 self.wfile.flush()
                 sent += len(chunk)
+                req_progress(sid, len(chunk))
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError) as e:
@@ -823,7 +1075,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
         finally:
             dur = time.time() - t0
-            stat_close(sid, bad=err is not None and err.startswith("流中断"))
+            traffic_add(0, sent, via_proxy)  # 下行：实际发给客户端的字节
+            if err is None:
+                req_finish(sid, True, sent=sent)
+            elif err.startswith("流中断"):
+                req_finish(sid, False, err, sent=sent)
+            else:
+                # 客户端提前断开：上游本身正常，记 warn 不计入失败
+                req_finish(sid, True, err, sent=sent, outcome="warn")
             if err:
                 msg = f"muse-proxy {err}，已发 {sent}B 后断开（本轮回复不完整）"
                 log(f"[{method} {self.path}] {msg} 用时 {dur:.2f}s")

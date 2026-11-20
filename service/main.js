@@ -4,6 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/service/main.ts
 import http from "node:http";
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -12,24 +13,29 @@ var TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
 var BASE = process.env.MUSE_PROXY_BASE ?? "http://127.0.0.1:8788";
 var POLL_MS = 15000;
 var STATE_FILE = join(homedir(), ".config", "openchamber-muse-proxy", "state.json");
+var PKG_VERSION = (() => {
+  try {
+    const raw = readFileSync(new URL("../package.json", import.meta.url), "utf8");
+    return String(JSON.parse(raw).version ?? "");
+  } catch {
+    return "";
+  }
+})();
 var health = null;
-var history = { switches: [], errors: [] };
+var lastClash = null;
 var lastNow = "";
-var lastErrTime = "";
 async function loadState() {
   try {
     await mkdir(join(homedir(), ".config", "openchamber-muse-proxy"), { recursive: true });
     const raw = await readFile(STATE_FILE, "utf8");
     const j = JSON.parse(raw);
-    if (Array.isArray(j.switches))
-      history.switches = j.switches.slice(-20);
-    if (Array.isArray(j.errors))
-      history.errors = j.errors.slice(-20);
+    if (j.clash && Array.isArray(j.clash.top))
+      lastClash = j.clash;
   } catch {}
 }
 async function saveState() {
   try {
-    await writeFile(STATE_FILE, JSON.stringify(history));
+    await writeFile(STATE_FILE, JSON.stringify({ clash: lastClash }));
   } catch {}
 }
 function stamp() {
@@ -42,31 +48,19 @@ async function poll() {
     const r = await fetch(`${BASE}/__health`, { signal: AbortSignal.timeout(5000) });
     const j = await r.json();
     const now = j.autoswitch?.now ?? "";
-    if (lastNow && now && now !== lastNow) {
-      history.switches.unshift(`${stamp()} ${lastNow} → ${now}`);
-      history.switches = history.switches.slice(0, 20);
-      saveState();
-    }
     if (now)
       lastNow = now;
-    const et = j.last_error?.time ?? "";
-    if (et && et !== lastErrTime) {
-      lastErrTime = et;
-      history.errors.unshift(`${et} ${j.last_error?.error ?? ""}`.slice(0, 500));
-      history.errors = history.errors.slice(0, 20);
-      saveState();
-    }
     health = { ...j, at: stamp(), reachable: true };
   } catch {
     health = { ok: false, at: stamp(), reachable: false };
   }
 }
-async function callProxy(path, body) {
+async function callProxy(path, body, timeoutMs = 15000) {
   const r = await fetch(`${BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
-    signal: AbortSignal.timeout(15000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
   let j = null;
   try {
@@ -82,17 +76,6 @@ function run(cmd, args, timeoutMs = 8000) {
       resolve({ code: err?.code ?? 0, out: String(stdout ?? stderr ?? "").trim() });
     });
   });
-}
-var LOG_FILE = join(homedir(), ".local", "share", "muse-proxy.log");
-async function tailLog(n) {
-  try {
-    const raw = await readFile(LOG_FILE, "utf8");
-    const lines = raw.split(`
-`).filter((l) => l.trim().length > 0);
-    return lines.slice(-Math.max(1, Math.min(50, n)));
-  } catch {
-    return [];
-  }
 }
 async function processState() {
   let listening = false;
@@ -189,13 +172,8 @@ var server = http.createServer((req, res) => {
     statusRows().then((rows) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(rows)), () => res.writeHead(500).end("{}"));
     return;
   }
-  if (req.method === "GET" && path === "/logs") {
-    const m = /lines=(\d+)/.exec(new URL(req.url ?? "/", "http://x").search);
-    tailLog(m ? Number(m[1]) : 10).then((lines) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ lines })), () => res.writeHead(500).end("{}"));
-    return;
-  }
   if (req.method === "GET" && path === "/full") {
-    processState().then((ps) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ health, history, process: ps })), () => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ health, history })));
+    processState().then((ps) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash, process: ps })), () => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash })));
     return;
   }
   let body = "";
@@ -206,17 +184,88 @@ var server = http.createServer((req, res) => {
     (async () => {
       if (req.method === "POST" && path === "/status") {
         let id = "";
+        let node = "";
         try {
-          id = JSON.parse(body || "{}").id ?? "";
+          const b = JSON.parse(body || "{}");
+          id = b.id ?? "";
+          node = b.node ?? "";
         } catch {}
         if (id === "switch") {
-          const r = await callProxy("/__switch", {});
+          if (node) {
+            const r2 = await callProxy("/__switch", { node });
+            const j2 = r2.json;
+            if (r2.status >= 200 && r2.status < 300) {
+              await poll();
+              res.writeHead(200).end(JSON.stringify({ switched_to: node }));
+            } else
+              res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: String(j2?.error ?? "换节点失败") }));
+            return;
+          }
+          const before = lastNow || health?.autoswitch?.now || "";
+          let r;
+          try {
+            r = await callProxy("/__clash-refresh", {}, 120000);
+          } catch (e) {
+            res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: `换节点中断：${e instanceof Error ? e.message : e}` }));
+            return;
+          }
+          const j = r.json;
+          if (!(r.status >= 200 && r.status < 300)) {
+            res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: String(j?.error ?? "测速失败，节点未动") }));
+            return;
+          }
+          const topNames = (j.top ?? []).map((t) => t.name).filter(Boolean);
+          const want = topNames.find((n) => n !== before) ?? "";
+          let final = j.now ?? "";
+          if (want && want !== (j.now ?? "")) {
+            const s = await callProxy("/__switch", { node: want });
+            if (s.status >= 200 && s.status < 300) {
+              final = want;
+            } else {
+              const sj = s.json;
+              res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: `已测速但切换失败（当前 ${j.now ?? before}）：${String(sj?.error ?? "换节点失败")}` }));
+              return;
+            }
+          }
+          lastClash = {
+            at: stamp(),
+            group: j.group ?? "",
+            now: final,
+            elapsed: j.elapsed ?? 0,
+            tested: j.tested ?? 0,
+            switched_to: final,
+            top: j.top ?? []
+          };
+          saveState();
+          await poll();
+          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ switched_to: final }));
+          return;
+        }
+        if (id === "clash-refresh") {
+          let r;
+          try {
+            r = await callProxy("/__clash-refresh", {}, 120000);
+          } catch (e) {
+            res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: `Clash 刷新超时或中断：${e instanceof Error ? e.message : e}` }));
+            return;
+          }
           const j = r.json;
           if (r.status >= 200 && r.status < 300) {
+            lastClash = {
+              at: stamp(),
+              group: j.group ?? "",
+              now: j.now ?? "",
+              elapsed: j.elapsed ?? 0,
+              tested: j.tested ?? 0,
+              switched_to: j.switched_to ?? "",
+              top: j.top ?? []
+            };
+            saveState();
             await poll();
-            res.writeHead(200).end("{}");
-          } else
-            res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: String(j?.error ?? "换节点失败") }));
+            res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ clash: lastClash }));
+          } else {
+            res.writeHead(502, { "Content-Type": "application/json" }).end(JSON.stringify({ message: String(j?.error ?? "Clash 刷新失败") }));
+          }
           return;
         }
         if (id === "probe") {

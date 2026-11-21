@@ -36,10 +36,26 @@ let health: (Health & { at: string; reachable: boolean }) | null = null;
 // 上次 Clash 刷新结果（订阅更新+测速 Top，内存+落盘，面板直接展示）
 let lastClash: {
   at: string; group: string; now: string; elapsed: number;
-  tested: number; switched_to: string;
+  tested: number; switched_to: string; sub_note: string;
   top: { name: string; delay_ms: number; blocked: boolean }[];
 } | null = null;
 let lastNow = '';
+// 当前节点延迟缓存：service 每 60s 测一次（单节点，轻量），面板直接展示
+const DELAY_MS = 60_000;
+let lastDelay: { at: string; name: string; delay_ms: number | null } | null = null;
+
+async function refreshDelay() {
+  const now = lastNow || health?.autoswitch?.now || '';
+  if (!now) return;
+  try {
+    const r = await callProxy('/__clash-delay', { node: now }, 15000);
+    const j = r.json as { ok?: boolean; node?: string; delay_ms?: number };
+    if (r.status >= 200 && r.status < 300 && typeof j.delay_ms === 'number') {
+      lastDelay = { at: stamp(), name: j.node || now, delay_ms: j.delay_ms };
+    }
+    // 失败则保留上次结果，不覆盖为空
+  } catch { /* 下次再试 */ }
+}
 
 async function loadState() {
   try {
@@ -180,8 +196,8 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === 'GET' && path === '/full') {
     processState().then(
-      (ps) => res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash, process: ps })),
-      () => res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash })),
+      (ps) => res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash, delay: lastDelay, process: ps })),
+      () => res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash, delay: lastDelay })),
     );
     return;
   }
@@ -216,7 +232,7 @@ const server = http.createServer((req, res) => {
           }
           const j = r.json as {
             error?: string; group?: string; now?: string; elapsed?: number;
-            tested?: number; switched_to?: string;
+            tested?: number; switched_to?: string; sub_note?: string;
             top?: { name: string; delay_ms: number; blocked: boolean }[];
           };
           if (!(r.status >= 200 && r.status < 300)) {
@@ -239,7 +255,7 @@ const server = http.createServer((req, res) => {
           lastClash = {
             at: stamp(), group: j.group ?? '', now: final,
             elapsed: j.elapsed ?? 0, tested: j.tested ?? 0,
-            switched_to: final, top: j.top ?? [],
+            switched_to: final, sub_note: j.sub_note ?? '', top: j.top ?? [],
           };
           void saveState();
           await poll();
@@ -257,14 +273,14 @@ const server = http.createServer((req, res) => {
           }
           const j = r.json as {
             ok?: boolean; error?: string; group?: string; now?: string;
-            elapsed?: number; tested?: number; switched_to?: string;
+            elapsed?: number; tested?: number; switched_to?: string; sub_note?: string;
             top?: { name: string; delay_ms: number; blocked: boolean }[];
           };
           if (r.status >= 200 && r.status < 300) {
             lastClash = {
               at: stamp(), group: j.group ?? '', now: j.now ?? '',
               elapsed: j.elapsed ?? 0, tested: j.tested ?? 0,
-              switched_to: j.switched_to ?? '', top: j.top ?? [],
+              switched_to: j.switched_to ?? '', sub_note: j.sub_note ?? '', top: j.top ?? [],
             };
             void saveState();
             await poll();
@@ -306,5 +322,7 @@ if (!PORT || !TOKEN) {
 }
 await loadState();
 await poll();
+await refreshDelay();
 setInterval(() => { void poll(); }, POLL_MS);
+setInterval(() => { void refreshDelay(); }, DELAY_MS);
 server.listen(PORT, '127.0.0.1');

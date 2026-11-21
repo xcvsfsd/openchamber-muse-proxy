@@ -75,10 +75,10 @@ PREFERRED_NODES = [
         "🇺🇸美国01|流媒体|0.1x,🇬🇧英国伦敦01|流媒体|0.1x,🇸🇬新加坡专线01|BGP|流媒体,🇯🇵日本高速01|BGP|CUCM",
     ).split(",") if n.strip()
 ]
-# muse 禁用节点：香港出口对 muse 不通（403 RegionError），一律不选，当前是它也要换走
+# muse 禁用节点：香港/台湾出口对 muse 不通（403 RegionError），一律不选，当前是它也要换走
 BLOCK_KEYWORDS = [
     k.strip().lower() for k in os.environ.get(
-        "MUSE_PROXY_BLOCK_NODES", "香港,hong kong,hongkong"
+        "MUSE_PROXY_BLOCK_NODES", "香港,hong kong,hongkong,台湾,taiwan"
     ).split(",") if k.strip()
 ]
 
@@ -117,7 +117,7 @@ TRAFFIC = {
     "up_muse": 0, "down_muse": 0,
     "events": deque(maxlen=1200),  # (ts, up_n, down_n)，算窗口速率用
 }
-TRAFFIC_WINDOW = 5.0  # 速率窗口秒（面板 5s 轮询一次，正好对齐）
+TRAFFIC_WINDOW = 5.0  # 速率窗口秒（滑动窗口内累计字节，用于 5s 内网速）
 
 
 def traffic_add(up_n: int, down_n: int, muse: bool) -> None:
@@ -143,11 +143,11 @@ def traffic_snapshot():
             "up_muse": TRAFFIC["up_muse"], "down_muse": TRAFFIC["down_muse"],
             "up_rate": round(up / TRAFFIC_WINDOW, 1),
             "down_rate": round(down / TRAFFIC_WINDOW, 1),
+            "up_window": up, "down_window": down,
             "window_s": TRAFFIC_WINDOW,
         }
 # stage 流转：收请求 → 建连中 → 等上游首字节 → 流式传输 → 完成/失败
 # 实时流程：每条转发请求的阶段追踪（面板判断卡住/失败用，只记内存，重启清零）
-# stage 流转：收请求 → 建连中 → 等上游首字节 → 流式传输 → 完成/失败
 REQS_ACTIVE = {}           # sid -> entry（在途）
 REQS_RECENT = deque(maxlen=20)  # 已完成（新在前）
 
@@ -264,7 +264,7 @@ def reqs_snapshot():
 
 
 def node_blocked(name: str) -> bool:
-    """muse 禁用节点判断（香港出口不可用）。"""
+    """muse 禁用节点判断（香港/台湾出口不可用）。"""
     if not name:
         return False
     low = name.lower()
@@ -392,7 +392,7 @@ def switch_node(exclude=()) -> str:
     for node in PREFERRED_NODES:
         if node not in alln or node == now or node in exclude:
             continue
-        if node_blocked(node):  # 双保险：候选里混进香港也不用
+        if node_blocked(node):  # 双保险：候选里混进香港/台湾也不用
             continue
         try:
             ctl_call(f"/proxies/{group}", {"name": node})
@@ -461,7 +461,7 @@ def prober_loop():
             elif not last_ok:
                 log("后台探活恢复，节点可用")
             if node_blocked(now) and now != last_node:
-                log(f"后台发现当前节点 {now} 已禁用（香港不可用于 muse），下次 muse 请求会自动换走")
+                log(f"后台发现当前节点 {now} 已禁用（香港/台湾不可用于 muse），下次 muse 请求会自动换走")
             last_ok, last_node = ok, now
         except Exception as e:
             log(f"后台探活异常：{e.__class__.__name__}: {e}")
@@ -692,7 +692,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_local_json(400, {"ok": False, "error": f"组 {group} 里没有节点 {want}"})
                 return
             if node_blocked(want):
-                self.send_local_json(400, {"ok": False, "error": f"节点 {want} 已禁用（香港不可用于 muse）"})
+                self.send_local_json(400, {"ok": False, "error": f"节点 {want} 已禁用（香港/台湾不可用于 muse）"})
                 return
             try:
                 ctl_call(f"/proxies/{group}", {"name": want})
@@ -741,13 +741,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             return (name, None)
 
+    def _provider_snapshot(self, providers: dict) -> dict:
+        """provider 名 -> (节点数, 名单哈希)，用来判断 PUT 后订阅内容是否真变了。"""
+        import hashlib
+        snap = {}
+        for pname, p in (providers or {}).items():
+            names = sorted(str(x.get("name") or "") for x in (p.get("proxies") or []))
+            snap[pname] = (len(names), hashlib.md5("|".join(names).encode()).hexdigest()[:12])
+        return snap
+
+    def handle_clash_delay(self, body: bytes) -> None:
+        """POST /__clash-delay {node?}：只测一个节点（默认当前节点），轻量定时刷新用。"""
+        want = ""
+        if body:
+            try:
+                want = str(json.loads(body.decode("utf-8", "replace")).get("node") or "")
+            except Exception:
+                want = ""
+        name = want or GROUP.get("now") or ""
+        if not name:
+            self.send_local_json(502, {"ok": False, "error": "当前无节点可测"})
+            return
+        _, delay = self.clash_delay(name)
+        if delay is None:
+            self.send_local_json(502, {"ok": False, "node": name, "error": "测速失败或超时"})
+            return
+        log(f"单节点测速 {name} = {delay}ms")
+        self.send_local_json(200, {"ok": True, "node": name, "delay_ms": delay})
+
     def handle_clash_refresh(self) -> None:
         """POST /__clash-refresh：订阅刷新 + 当前策略组全节点测速，返回最快 TopN。
 
-        步骤：逐个 PUT /providers/proxies/{名} 触发订阅更新 →
-        顺手触发一次 clash 自带 healthcheck（异步，不管结果）→
-        对当前组全部真实节点 10 并发打 delay → 按延迟排序取最快，
-        香港等禁用节点不进 Top（muse 不可用，进去也切不过去）。
+        步骤：逐个 PUT /providers/proxies/{名} 触发订阅更新（前后对名单做哈希，
+        没变化就如实报告，免得 204 误导人）→ 顺手触发一次 clash 自带
+        healthcheck（异步，不管结果）→ 对当前组全部真实节点 10 并发打
+        delay → 按延迟排序取最快，香港/台湾等禁用节点不进 Top
+        （muse 不可用，进去也切不过去）。
+        注意：节点内联在 Verge profile 里的，核心 PUT 拉不到新东西，
+        那种订阅只能去 Verge 里点更新。
         """
         t0 = time.time()
         try:
@@ -758,6 +789,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             log(f"Clash 刷新失败：{msg}")
             self.send_local_json(502, {"ok": False, "error": msg})
             return
+        before = self._provider_snapshot(providers)
         updated, upd_fail = [], []
         for pname in providers.keys():
             try:
@@ -767,6 +799,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 updated.append(pname)
             except Exception as e:
                 upd_fail.append(f"{pname}：{e}")
+        # 给核心一点时间做异步拉取，再重读对比名单是否真变了
+        time.sleep(3)
+        try:
+            after_providers = (ctl_request("GET", "/providers/proxies", timeout=8)
+                               or {}).get("providers") or {}
+        except Exception:
+            after_providers = {}
+        after = self._provider_snapshot(after_providers)
+        changed, same = [], []
+        for pname in updated:
+            b, a = before.get(pname, (0, "")), after.get(pname, (0, ""))
+            if b != a and pname in after:
+                changed.append({"name": pname, "before": b[0], "after": a[0]})
+            else:
+                same.append(pname)
+        if changed:
+            sub_note = "订阅已更新：" + "、".join(f"{c['name']}{c['before']}→{c['after']}个" for c in changed)
+        elif updated:
+            sub_note = "订阅内容无变化（源站无更新，或节点内联在 Verge profile 里，只能去 Verge 点更新）"
+        else:
+            sub_note = ""
         # 触发 clash 自带健康检查（后台异步做，只为刷新它自己的 alive 状态）
         try:
             u = urllib.parse.quote(CLASH_TEST_URL, safe="")
@@ -779,14 +832,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not group:
             self.send_local_json(502, {
                 "ok": False, "error": "控制口不可达或组内无候选，找不到承载 muse 的策略组",
-                "providers_updated": updated, "providers_failed": upd_fail})
+                "providers_updated": updated, "providers_failed": upd_fail,
+                "sub_note": sub_note})
             return
         try:
             alln = (ctl_call(f"/proxies/{group}") or {}).get("all") or []
         except Exception as e:
             self.send_local_json(502, {
                 "ok": False, "error": f"读组 {group} 失败：{e}",
-                "providers_updated": updated, "providers_failed": upd_fail})
+                "providers_updated": updated, "providers_failed": upd_fail,
+                "sub_note": sub_note})
             return
         candidates = [n for n in alln if self._is_real_node(n)]
         results = []
@@ -824,7 +879,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     switch_error = f"{e.__class__.__name__}: {e}"
                     log(f"自动切最快节点 {want} 失败({switch_error})，保持 {now}")
         elapsed = round(time.time() - t0, 1)
-        log(f"Clash 刷新完成（{elapsed}s）：订阅更新 {len(updated)} 个，"
+        log(f"Clash 刷新完成（{elapsed}s）：{sub_note}；"
             f"测速 {len(results)}/{len(candidates)}，"
             f"Top{len(top)} {', '.join(f'{n} {d}ms' for n, d in usable[:CLASH_TOP_N]) or '无'}"
             f"{'，已切 ' + switched_to if switched_to else ''}")
@@ -834,7 +889,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "providers_failed": upd_fail, "tested": len(results),
             "failed_n": failed_n,
             "blocked_skipped": len(scored) - len(usable),
-            "top": top,
+            "providers_changed": changed, "providers_same": same,
+            "sub_note": sub_note, "top": top,
             "switched_to": switched_to, "switch_error": switch_error,
         })
 
@@ -868,6 +924,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/__clash-refresh" and method == "POST":
             self.handle_clash_refresh()
             return
+        if self.path == "/__clash-delay" and method == "POST":
+            try:
+                body = self.read_body()
+            except Exception as e:
+                self.send_proxy_error(400, f"请求体读取失败：{e}")
+                return
+            self.handle_clash_delay(body)
+            return
         if self.path.startswith("/__"):
             self.send_proxy_error(404, f"未知本地端点：{self.path}")
             return
@@ -896,14 +960,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if body or method in ("POST", "PUT", "PATCH"):
             headers["Content-Length"] = str(len(body))
 
-        # 0) 香港节点对 muse 不通：当前就是它就先换走，别等上游 403（只读后台缓存，不阻塞）
+        # 0) 香港/台湾节点对 muse 不通：当前就是它就先换走，别等上游 403（只读后台缓存，不阻塞）
         if via_proxy and AUTOSWITCH:
             cur = GROUP["now"]
             if node_blocked(cur) and GROUP["group"]:
-                log(f"[{method} {self.path}] 当前节点 {cur} 已禁用（香港不可用于 muse），换走")
+                log(f"[{method} {self.path}] 当前节点 {cur} 已禁用（香港/台湾不可用于 muse），换走")
                 node = switch_node(exclude=(cur,))
                 if not node:
-                    msg = (f"muse-proxy 当前节点 {cur} 被禁用（香港出口对 muse 不可用），"
+                    msg = (f"muse-proxy 当前节点 {cur} 被禁用（香港/台湾出口对 muse 不可用），"
                            "且没有可用候选节点；去 Verge 手动换：美国01 → 伦敦01 → 新加坡专线01")
                     log(f"[{method} {self.path}] {msg}")
                     note_error(self.path, "proxy", msg)

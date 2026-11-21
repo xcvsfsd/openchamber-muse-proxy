@@ -24,6 +24,20 @@ var PKG_VERSION = (() => {
 var health = null;
 var lastClash = null;
 var lastNow = "";
+var DELAY_MS = 60000;
+var lastDelay = null;
+async function refreshDelay() {
+  const now = lastNow || health?.autoswitch?.now || "";
+  if (!now)
+    return;
+  try {
+    const r = await callProxy("/__clash-delay", { node: now }, 15000);
+    const j = r.json;
+    if (r.status >= 200 && r.status < 300 && typeof j.delay_ms === "number") {
+      lastDelay = { at: stamp(), name: j.node || now, delay_ms: j.delay_ms };
+    }
+  } catch {}
+}
 async function loadState() {
   try {
     await mkdir(join(homedir(), ".config", "openchamber-muse-proxy"), { recursive: true });
@@ -173,7 +187,7 @@ var server = http.createServer((req, res) => {
     return;
   }
   if (req.method === "GET" && path === "/full") {
-    processState().then((ps) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash, process: ps })), () => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash })));
+    processState().then((ps) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash, delay: lastDelay, process: ps })), () => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ version: PKG_VERSION, health, clash: lastClash, delay: lastDelay })));
     return;
   }
   let body = "";
@@ -234,6 +248,7 @@ var server = http.createServer((req, res) => {
             elapsed: j.elapsed ?? 0,
             tested: j.tested ?? 0,
             switched_to: final,
+            sub_note: j.sub_note ?? "",
             top: j.top ?? []
           };
           saveState();
@@ -258,6 +273,7 @@ var server = http.createServer((req, res) => {
               elapsed: j.elapsed ?? 0,
               tested: j.tested ?? 0,
               switched_to: j.switched_to ?? "",
+              sub_note: j.sub_note ?? "",
               top: j.top ?? []
             };
             saveState();
@@ -310,7 +326,11 @@ if (!PORT || !TOKEN) {
 }
 await loadState();
 await poll();
+await refreshDelay();
 setInterval(() => {
   poll();
 }, POLL_MS);
+setInterval(() => {
+  refreshDelay();
+}, DELAY_MS);
 server.listen(PORT, "127.0.0.1");
